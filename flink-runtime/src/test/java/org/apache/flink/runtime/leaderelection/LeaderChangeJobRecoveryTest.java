@@ -18,28 +18,30 @@
 
 package org.apache.flink.runtime.leaderelection;
 
-import akka.actor.ActorRef;
-import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.executiongraph.ExecutionGraph;
-import org.apache.flink.runtime.executiongraph.restart.FixedDelayRestartStrategy;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
+import org.apache.flink.runtime.highavailability.TestingHighAvailabilityServices;
+import org.apache.flink.runtime.highavailability.TestingManualHighAvailabilityServices;
 import org.apache.flink.runtime.instance.ActorGateway;
-import org.apache.flink.runtime.instance.AkkaActorGateway;
+import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobmanager.Tasks;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
-import org.apache.flink.runtime.messages.ExecutionGraphMessages;
+import org.apache.flink.runtime.testingUtils.TestingCluster;
 import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages;
 import org.apache.flink.util.TestLogger;
+
 import org.junit.Before;
 import org.junit.Test;
+
 import scala.concurrent.Await;
-import scala.concurrent.ExecutionContext;
 import scala.concurrent.Future;
-import scala.concurrent.Promise;
 import scala.concurrent.duration.FiniteDuration;
 
 import java.util.UUID;
@@ -56,21 +58,34 @@ public class LeaderChangeJobRecoveryTest extends TestLogger {
 	private int numSlotsPerTM = 1;
 	private int parallelism = numTMs * numSlotsPerTM;
 
-	private Configuration configuration;
-	private LeaderElectionRetrievalTestingCluster cluster = null;
+	private JobID jobId;
+	private TestingCluster cluster = null;
 	private JobGraph job = createBlockingJob(parallelism);
+	private TestingManualHighAvailabilityServices highAvailabilityServices;
 
 	@Before
 	public void before() throws TimeoutException, InterruptedException {
+		jobId = HighAvailabilityServices.DEFAULT_JOB_ID;
+
 		Tasks.BlockingOnceReceiver$.MODULE$.blocking_$eq(true);
 
-		configuration = new Configuration();
+		Configuration configuration = new Configuration();
 
 		configuration.setInteger(ConfigConstants.LOCAL_NUMBER_JOB_MANAGER, 1);
 		configuration.setInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER, numTMs);
-		configuration.setInteger(ConfigConstants.TASK_MANAGER_NUM_TASK_SLOTS, numSlotsPerTM);
+		configuration.setInteger(TaskManagerOptions.NUM_TASK_SLOTS, numSlotsPerTM);
 
-		cluster = new LeaderElectionRetrievalTestingCluster(configuration, true, false, new FixedDelayRestartStrategy(9999, 100));
+		configuration.setString(ConfigConstants.RESTART_STRATEGY, "fixeddelay");
+		configuration.setInteger(ConfigConstants.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 9999);
+		configuration.setString(ConfigConstants.RESTART_STRATEGY_FIXED_DELAY_DELAY, "100 milli");
+
+		highAvailabilityServices = new TestingManualHighAvailabilityServices();
+
+		cluster = new TestingCluster(
+			configuration,
+			highAvailabilityServices,
+			true,
+			false);
 		cluster.start(false);
 
 		// wait for actors to be alive so that they have started their leader retrieval service
@@ -87,8 +102,15 @@ public class LeaderChangeJobRecoveryTest extends TestLogger {
 	public void testNotRestartedWhenLosingLeadership() throws Exception {
 		UUID leaderSessionID = UUID.randomUUID();
 
-		cluster.grantLeadership(0, leaderSessionID);
-		cluster.notifyRetrievalListeners(0, leaderSessionID);
+		highAvailabilityServices.grantLeadership(
+			jobId,
+			0,
+			leaderSessionID);
+
+		highAvailabilityServices.notifyRetrievers(
+			jobId,
+			0,
+			leaderSessionID);
 
 		cluster.waitForTaskManagersToBeRegistered(timeout);
 
@@ -107,17 +129,11 @@ public class LeaderChangeJobRecoveryTest extends TestLogger {
 
 		assertTrue(responseExecutionGraph instanceof TestingJobManagerMessages.ExecutionGraphFound);
 
-		ExecutionGraph executionGraph = ((TestingJobManagerMessages.ExecutionGraphFound) responseExecutionGraph).executionGraph();
+		ExecutionGraph executionGraph = (ExecutionGraph) ((TestingJobManagerMessages.ExecutionGraphFound) responseExecutionGraph).executionGraph();
 
-		TestActorGateway testActorGateway = new TestActorGateway();
+		highAvailabilityServices.revokeLeadership(jobId);
 
-		executionGraph.registerJobStatusListener(testActorGateway);
-
-		cluster.revokeLeadership();
-
-		Future<Boolean> hasReachedTerminalState = testActorGateway.hasReachedTerminalState();
-
-		assertTrue("The job should have reached a terminal state.", Await.result(hasReachedTerminalState, timeout));
+		executionGraph.getTerminationFuture().get(30, TimeUnit.SECONDS);
 	}
 
 	public JobGraph createBlockingJob(int parallelism) {
@@ -132,73 +148,12 @@ public class LeaderChangeJobRecoveryTest extends TestLogger {
 		sender.setParallelism(parallelism);
 		receiver.setParallelism(parallelism);
 
-		receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE);
+		receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE, ResultPartitionType.PIPELINED);
 
 		SlotSharingGroup slotSharingGroup = new SlotSharingGroup();
 		sender.setSlotSharingGroup(slotSharingGroup);
 		receiver.setSlotSharingGroup(slotSharingGroup);
 
-		ExecutionConfig executionConfig = new ExecutionConfig();
-
-		JobGraph jobGraph = new JobGraph("Blocking test job", sender, receiver);
-		jobGraph.setExecutionConfig(executionConfig);
-
-		return jobGraph;
-	}
-
-	public static class TestActorGateway implements ActorGateway {
-
-		private static final long serialVersionUID = -736146686160538227L;
-		private transient Promise<Boolean> terminalState = new scala.concurrent.impl.Promise.DefaultPromise<>();
-
-		public Future<Boolean> hasReachedTerminalState() {
-			return terminalState.future();
-		}
-
-		@Override
-		public Future<Object> ask(Object message, FiniteDuration timeout) {
-			return null;
-		}
-
-		@Override
-		public void tell(Object message) {
-			this.tell(message, new AkkaActorGateway(ActorRef.noSender(), null));
-		}
-
-		@Override
-		public void tell(Object message, ActorGateway sender) {
-			if (message instanceof ExecutionGraphMessages.JobStatusChanged) {
-				ExecutionGraphMessages.JobStatusChanged jobStatusChanged = (ExecutionGraphMessages.JobStatusChanged) message;
-
-				if (jobStatusChanged.newJobStatus().isTerminalState()) {
-					terminalState.success(true);
-				}
-			}
-		}
-
-		@Override
-		public void forward(Object message, ActorGateway sender) {
-
-		}
-
-		@Override
-		public Future<Object> retry(Object message, int numberRetries, FiniteDuration timeout, ExecutionContext executionContext) {
-			return null;
-		}
-
-		@Override
-		public String path() {
-			return null;
-		}
-
-		@Override
-		public ActorRef actor() {
-			return null;
-		}
-
-		@Override
-		public UUID leaderSessionID() {
-			return null;
-		}
+		return new JobGraph("Blocking test job", sender, receiver);
 	}
 }

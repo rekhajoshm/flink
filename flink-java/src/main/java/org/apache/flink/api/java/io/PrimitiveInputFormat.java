@@ -44,14 +44,13 @@ public class PrimitiveInputFormat<OT> extends DelimitedInputFormat<OT> {
 
 	private transient FieldParser<OT> parser;
 
-
 	public PrimitiveInputFormat(Path filePath, Class<OT> primitiveClass) {
-		super(filePath);
+		super(filePath, null);
 		this.primitiveClass = primitiveClass;
 	}
 
 	public PrimitiveInputFormat(Path filePath, String delimiter, Class<OT> primitiveClass) {
-		super(filePath);
+		super(filePath, null);
 		this.primitiveClass = primitiveClass;
 		this.setDelimiter(delimiter);
 	}
@@ -70,16 +69,16 @@ public class PrimitiveInputFormat<OT> extends DelimitedInputFormat<OT> {
 	public OT readRecord(OT reuse, byte[] bytes, int offset, int numBytes) throws IOException {
 		// Check if \n is used as delimiter and the end of this line is a \r, then remove \r from the line
 		if (this.getDelimiter().length == 1 && this.getDelimiter()[0] == NEW_LINE
-			&& offset+numBytes >= 1 && bytes[offset+numBytes-1] == CARRIAGE_RETURN){
+			&& offset + numBytes >= 1 && bytes[offset + numBytes - 1] == CARRIAGE_RETURN) {
 			numBytes -= 1;
 		}
 
 		// Null character as delimiter is used because there's only 1 field to be parsed
-		if (parser.parseField(bytes, offset, numBytes + offset, new byte[]{'\0'}, reuse) >= 0) {
+		if (parser.resetErrorStateAndParse(bytes, offset, numBytes + offset, new byte[]{'\0'}, reuse) >= 0) {
 			return parser.getLastResult();
 		} else {
-			String s = new String(bytes, offset, numBytes);
-			throw new IOException("Could not parse value: \""+s+"\" as type "+primitiveClass.getSimpleName());
+			String s = new String(bytes, offset, numBytes, getCharset());
+			throw new IOException("Could not parse value: \"" + s + "\" as type " + primitiveClass.getSimpleName());
 		}
 	}
 }

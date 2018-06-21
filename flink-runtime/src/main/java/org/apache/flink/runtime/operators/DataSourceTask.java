@@ -19,23 +19,30 @@
 package org.apache.flink.runtime.operators;
 
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.api.common.io.InputFormat;
 import org.apache.flink.api.common.io.RichInputFormat;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerFactory;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.InputSplit;
-import org.apache.flink.runtime.accumulators.AccumulatorRegistry;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.execution.CancelTaskException;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.api.writer.RecordWriter;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.jobgraph.tasks.InputSplitProvider;
+import org.apache.flink.runtime.jobgraph.tasks.InputSplitProviderException;
+import org.apache.flink.runtime.metrics.groups.OperatorIOMetricGroup;
+import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.operators.chaining.ChainedDriver;
 import org.apache.flink.runtime.operators.chaining.ExceptionInChainedStubException;
 import org.apache.flink.runtime.operators.util.DistributedRuntimeUDFContext;
 import org.apache.flink.runtime.operators.util.TaskConfig;
+import org.apache.flink.runtime.operators.util.metrics.CountingCollector;
 import org.apache.flink.util.Collector;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,6 +81,15 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 	// cancel flag
 	private volatile boolean taskCanceled = false;
 
+	/**
+	 * Create an Invokable task and set its environment.
+	 *
+	 * @param environment The environment assigned to this invokable.
+	 */
+	public DataSourceTask(Environment environment) {
+		super(environment);
+	}
+
 	@Override
 	public void invoke() throws Exception {
 		// --------------------------------------------------------------------
@@ -97,8 +113,29 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 		// --------------------------------------------------------------------
 		LOG.debug(getLogString("Starting data source operator"));
 
+		RuntimeContext ctx = createRuntimeContext();
+
+		final Counter numRecordsOut;
+		{
+			Counter tmpNumRecordsOut;
+			try {
+				OperatorIOMetricGroup ioMetricGroup = ((OperatorMetricGroup) ctx.getMetricGroup()).getIOMetricGroup();
+				ioMetricGroup.reuseInputMetricsForTask();
+				if (this.config.getNumberOfChainedStubs() == 0) {
+					ioMetricGroup.reuseOutputMetricsForTask();
+				}
+				tmpNumRecordsOut = ioMetricGroup.getNumRecordsOutCounter();
+			} catch (Exception e) {
+				LOG.warn("An exception occurred during the metrics setup.", e);
+				tmpNumRecordsOut = new SimpleCounter();
+			}
+			numRecordsOut = tmpNumRecordsOut;
+		}
+		
+		Counter completedSplitsCounter = ctx.getMetricGroup().counter("numSplitsProcessed");
+
 		if (RichInputFormat.class.isAssignableFrom(this.format.getClass())) {
-			((RichInputFormat) this.format).setRuntimeContext(createRuntimeContext());
+			((RichInputFormat) this.format).setRuntimeContext(ctx);
 			LOG.debug(getLogString("Rich Source detected. Initializing runtime context."));
 			((RichInputFormat) this.format).openInputFormat();
 			LOG.debug(getLogString("Rich Source detected. Opening the InputFormat."));
@@ -135,7 +172,7 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 				LOG.debug(getLogString("Starting to read input from split " + split.toString()));
 				
 				try {
-					final Collector<OT> output = this.output;
+					final Collector<OT> output = new CountingCollector<>(this.output, numRecordsOut);
 
 					if (objectReuseEnabled) {
 						OT reuse = serializer.createInstance();
@@ -165,6 +202,7 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 					// close. We close here such that a regular close throwing an exception marks a task as failed.
 					format.close();
 				}
+				completedSplitsCounter.inc();
 			} // end for all input splits
 
 			// close the collector. if it is a chaining task collector, it will close its chained tasks
@@ -216,7 +254,7 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 		this.taskCanceled = true;
 		LOG.debug(getLogString("Cancelling data source operator"));
 	}
-	
+
 	/**
 	 * Initializes the InputFormat implementation and configuration.
 	 * 
@@ -271,11 +309,8 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 		this.chainedTasks = new ArrayList<ChainedDriver<?, ?>>();
 		this.eventualOutputs = new ArrayList<RecordWriter<?>>();
 
-		final AccumulatorRegistry accumulatorRegistry = getEnvironment().getAccumulatorRegistry();
-		final AccumulatorRegistry.Reporter reporter = accumulatorRegistry.getReadWriteReporter();
-
 		this.output = BatchTask.initOutputs(this, cl, this.config, this.chainedTasks, this.eventualOutputs,
-				getExecutionConfig(), reporter, getEnvironment().getAccumulatorRegistry().getUserMap());
+				getExecutionConfig(), getEnvironment().getAccumulatorRegistry().getUserMap());
 	}
 
 	// ------------------------------------------------------------------------
@@ -324,9 +359,14 @@ public class DataSourceTask<OT> extends AbstractInvokable {
 				if (nextSplit != null) {
 					return true;
 				}
-				
-				InputSplit split = provider.getNextInputSplit();
-				
+
+				final InputSplit split;
+				try {
+					split = provider.getNextInputSplit(getUserCodeClassLoader());
+				} catch (InputSplitProviderException e) {
+					throw new RuntimeException("Could not retrieve next input split.", e);
+				}
+
 				if (split != null) {
 					this.nextSplit = split;
 					return true;

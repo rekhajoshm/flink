@@ -23,8 +23,8 @@ import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor;
 import org.apache.flink.streaming.api.functions.windowing.delta.DeltaFunction;
 import org.apache.flink.streaming.api.windowing.assigners.GlobalWindows;
 import org.apache.flink.streaming.api.windowing.evictors.TimeEvictor;
@@ -37,14 +37,12 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * An example of grouped stream windowing where different eviction and trigger
- * policies can be used. A source fetches events from cars every 1 sec
+ * policies can be used. A source fetches events from cars every 100 msec
  * containing their id, their current speed (kmh), overall elapsed distance (m)
  * and a timestamp. The streaming example triggers the top speed of each car
  * every x meters elapsed for the last y seconds.
  */
 public class TopSpeedWindowing {
-
-	private static final int NUM_CAR_EVENTS = 100;
 
 	// *************************************************************************
 	// PROGRAM
@@ -111,7 +109,6 @@ public class TopSpeedWindowing {
 		private Random rand = new Random();
 
 		private volatile boolean isRunning = true;
-		private int counter;
 
 		private CarSource(int numOfCars) {
 			speeds = new Integer[numOfCars];
@@ -127,7 +124,7 @@ public class TopSpeedWindowing {
 		@Override
 		public void run(SourceContext<Tuple4<Integer, Integer, Double, Long>> ctx) throws Exception {
 
-			while (isRunning && counter < NUM_CAR_EVENTS) {
+			while (isRunning) {
 				Thread.sleep(100);
 				for (int carId = 0; carId < speeds.length; carId++) {
 					if (rand.nextBoolean()) {
@@ -139,7 +136,6 @@ public class TopSpeedWindowing {
 					Tuple4<Integer, Integer, Double, Long> record = new Tuple4<>(carId,
 							speeds[carId], distances[carId], System.currentTimeMillis());
 					ctx.collect(record);
-					counter++;
 				}
 			}
 		}

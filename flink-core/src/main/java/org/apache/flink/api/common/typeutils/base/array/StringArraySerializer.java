@@ -38,11 +38,10 @@ public final class StringArraySerializer extends TypeSerializerSingleton<String[
 	private static final String[] EMPTY = new String[0];
 	
 	public static final StringArraySerializer INSTANCE = new StringArraySerializer();
-	
-	
+
 	@Override
 	public boolean isImmutableType() {
-		return true;
+		return false;
 	}
 
 	@Override

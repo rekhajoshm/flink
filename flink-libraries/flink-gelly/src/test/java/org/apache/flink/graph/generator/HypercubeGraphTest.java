@@ -19,21 +19,21 @@
 package org.apache.flink.graph.generator;
 
 import org.apache.flink.api.java.io.DiscardingOutputFormat;
-import org.apache.flink.graph.Edge;
 import org.apache.flink.graph.Graph;
-import org.apache.flink.graph.Vertex;
 import org.apache.flink.types.LongValue;
 import org.apache.flink.types.NullValue;
+
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 
-public class HypercubeGraphTest
-extends AbstractGraphTest {
+/**
+ * Tests for {@link HypercubeGraph}.
+ */
+public class HypercubeGraphTest extends GraphGeneratorTestBase {
 
 	@Test
-	public void testGraph()
-			throws Exception {
+	public void testGraph() throws Exception {
 		int dimensions = 3;
 
 		Graph<LongValue, NullValue, NullValue> graph = new HypercubeGraph(env, dimensions)
@@ -47,8 +47,7 @@ extends AbstractGraphTest {
 	}
 
 	@Test
-	public void testGraphMetrics()
-			throws Exception {
+	public void testGraphMetrics() throws Exception {
 		int dimensions = 10;
 
 		Graph<LongValue, NullValue, NullValue> graph = new HypercubeGraph(env, dimensions)
@@ -57,10 +56,10 @@ extends AbstractGraphTest {
 		assertEquals(1L << dimensions, graph.numberOfVertices());
 		assertEquals(dimensions * (1L << dimensions), graph.numberOfEdges());
 
-		long minInDegree = graph.inDegrees().min(1).collect().get(0).f1;
-		long minOutDegree = graph.outDegrees().min(1).collect().get(0).f1;
-		long maxInDegree = graph.inDegrees().max(1).collect().get(0).f1;
-		long maxOutDegree = graph.outDegrees().max(1).collect().get(0).f1;
+		long minInDegree = graph.inDegrees().min(1).collect().get(0).f1.getValue();
+		long minOutDegree = graph.outDegrees().min(1).collect().get(0).f1.getValue();
+		long maxInDegree = graph.inDegrees().max(1).collect().get(0).f1.getValue();
+		long maxOutDegree = graph.outDegrees().max(1).collect().get(0).f1.getValue();
 
 		assertEquals(dimensions, minInDegree);
 		assertEquals(dimensions, minOutDegree);
@@ -69,16 +68,15 @@ extends AbstractGraphTest {
 	}
 
 	@Test
-	public void testParallelism()
-			throws Exception {
+	public void testParallelism() throws Exception {
 		int parallelism = 2;
 
-		Graph<LongValue,NullValue,NullValue> graph = new HypercubeGraph(env, 4)
+		Graph<LongValue, NullValue, NullValue> graph = new HypercubeGraph(env, 4)
 			.setParallelism(parallelism)
 			.generate();
 
-		graph.getVertices().output(new DiscardingOutputFormat<Vertex<LongValue,NullValue>>());
-		graph.getEdges().output(new DiscardingOutputFormat<Edge<LongValue,NullValue>>());
+		graph.getVertices().output(new DiscardingOutputFormat<>());
+		graph.getEdges().output(new DiscardingOutputFormat<>());
 
 		TestUtils.verifyParallelism(env, parallelism);
 	}

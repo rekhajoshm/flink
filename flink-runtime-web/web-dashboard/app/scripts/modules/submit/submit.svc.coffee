@@ -23,7 +23,7 @@ angular.module('flinkApp')
   @loadJarList = () ->
     deferred = $q.defer()
 
-    $http.get("jars/")
+    $http.get(flinkConfig.jobServer + "jars/")
     .success (data, status, headers, config) ->
       deferred.resolve(data)
 
@@ -32,7 +32,7 @@ angular.module('flinkApp')
   @deleteJar = (id) ->
     deferred = $q.defer()
 
-    $http.delete("jars/" + id)
+    $http.delete(flinkConfig.jobServer + "jars/" + encodeURIComponent(id))
     .success (data, status, headers, config) ->
        deferred.resolve(data)
 
@@ -41,18 +41,28 @@ angular.module('flinkApp')
   @getPlan = (id, args) ->
     deferred = $q.defer()
 
-    $http.get("jars/" + id + "/plan", {params: args})
+    $http.get(flinkConfig.jobServer + "jars/" + encodeURIComponent(id) + "/plan", {params: args})
     .success (data, status, headers, config) ->
       deferred.resolve(data)
+    .error (err) ->
+      if err.errors?
+        deferred.reject(err.errors[0])
+      else
+        deferred.reject(err)
 
     deferred.promise
 
   @runJob = (id, args) ->
     deferred = $q.defer()
 
-    $http.post("jars/" + id + "/run", {}, {params: args})
+    $http.post(flinkConfig.jobServer + "jars/" + encodeURIComponent(id) + "/run", {}, {params: args})
     .success (data, status, headers, config) ->
       deferred.resolve(data)
+    .error (err) ->
+      if err.errors?
+        deferred.reject(err.errors[0])
+      else
+        deferred.reject(err)
 
     deferred.promise
 

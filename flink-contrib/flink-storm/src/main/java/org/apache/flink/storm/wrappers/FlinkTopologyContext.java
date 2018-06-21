@@ -17,17 +17,17 @@
 
 package org.apache.flink.storm.wrappers;
 
-import backtype.storm.generated.StormTopology;
-import backtype.storm.hooks.ITaskHook;
-import backtype.storm.metric.api.CombinedMetric;
-import backtype.storm.metric.api.ICombiner;
-import backtype.storm.metric.api.IMetric;
-import backtype.storm.metric.api.IReducer;
-import backtype.storm.metric.api.ReducedMetric;
-import backtype.storm.state.ISubscribedState;
-import backtype.storm.task.TopologyContext;
-import backtype.storm.tuple.Fields;
 import clojure.lang.Atom;
+import org.apache.storm.generated.StormTopology;
+import org.apache.storm.hooks.ITaskHook;
+import org.apache.storm.metric.api.CombinedMetric;
+import org.apache.storm.metric.api.ICombiner;
+import org.apache.storm.metric.api.IMetric;
+import org.apache.storm.metric.api.IReducer;
+import org.apache.storm.metric.api.ReducedMetric;
+import org.apache.storm.state.ISubscribedState;
+import org.apache.storm.task.TopologyContext;
+import org.apache.storm.tuple.Fields;
 
 import java.util.Collection;
 import java.util.List;
@@ -120,9 +120,8 @@ final class FlinkTopologyContext extends TopologyContext {
 	 * @throws UnsupportedOperationException
 	 * 		at every invocation
 	 */
-	@SuppressWarnings("unchecked")
 	@Override
-	public IMetric registerMetric(final String name, final IMetric metric, final int timeBucketSizeInSecs) {
+	public <T extends IMetric> T registerMetric(final String name, final T metric, final int timeBucketSizeInSecs) {
 		throw new UnsupportedOperationException("Metrics are not supported by Flink");
 	}
 

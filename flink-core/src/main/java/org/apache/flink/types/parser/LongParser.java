@@ -32,6 +32,12 @@ public class LongParser extends FieldParser<Long> {
 
 	@Override
 	public int parseField(byte[] bytes, int startPos, int limit, byte[] delimiter, Long reusable) {
+
+		if (startPos == limit) {
+			setErrorState(ParseErrorState.EMPTY_COLUMN);
+			return -1;
+		}
+
 		long val = 0;
 		boolean neg = false;
 
@@ -51,7 +57,7 @@ public class LongParser extends FieldParser<Long> {
 		for (int i = startPos; i < limit; i++) {
 			if (i < delimLimit && delimiterNext(bytes, i, delimiter)) {
 				if (i == startPos) {
-					setErrorState(ParseErrorState.EMPTY_STRING);
+					setErrorState(ParseErrorState.EMPTY_COLUMN);
 					return -1;
 				}
 				this.result = neg ? -val : val;
@@ -72,7 +78,7 @@ public class LongParser extends FieldParser<Long> {
 
 					if (i+1 >= limit) {
 						return limit;
-					} else if (i+1 < delimLimit && delimiterNext(bytes, i+1, delimiter)) {
+					} else if (i + 1 < delimLimit && delimiterNext(bytes, i + 1, delimiter)) {
 						return i + 1 + delimiter.length;
 					} else {
 						setErrorState(ParseErrorState.NUMERIC_VALUE_OVERFLOW_UNDERFLOW);
@@ -160,7 +166,7 @@ public class LongParser extends FieldParser<Long> {
 			if (val < 0) {
 				// this is an overflow/underflow, unless we hit exactly the Long.MIN_VALUE
 				if (neg && val == Long.MIN_VALUE) {
-					if (length == 1 || bytes[startPos+1] == delimiter) {
+					if (length == 1 || bytes[startPos + 1] == delimiter) {
 						return Long.MIN_VALUE;
 					} else {
 						throw new NumberFormatException("value overflow");

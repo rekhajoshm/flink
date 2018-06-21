@@ -21,8 +21,9 @@ package org.apache.flink.api
 import org.apache.flink.api.common.ExecutionConfig
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.api.common.typeutils.TypeSerializer
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable
 import org.apache.flink.api.java.{DataSet => JavaDataSet}
-import org.apache.flink.api.scala.typeutils.{CaseClassSerializer, CaseClassTypeInfo, TypeUtils, ScalaNothingTypeInfo}
+import org.apache.flink.api.scala.typeutils.{CaseClassSerializer, CaseClassTypeInfo, ScalaNothingTypeInfo, TypeUtils}
 
 import _root_.scala.reflect.ClassTag
 import language.experimental.macros
@@ -51,6 +52,14 @@ package object scala {
 
   // We need to wrap Java DataSet because we need the scala operations
   private[flink] def wrap[R: ClassTag](set: JavaDataSet[R]) = new DataSet[R](set)
+
+  // Checks if object has explicit type information using ResultTypeQueryable
+  private[flink] def explicitFirst[T](
+      funcOrInputFormat: AnyRef,
+      typeInfo: TypeInformation[T]): TypeInformation[T] = funcOrInputFormat match {
+    case rtq: ResultTypeQueryable[_] => rtq.asInstanceOf[ResultTypeQueryable[T]].getProducedType
+    case _ => typeInfo
+  }
 
   private[flink] def fieldNames2Indices(
       typeInfo: TypeInformation[_],
@@ -97,11 +106,23 @@ package object scala {
           fieldSerializers(i) = types(i).createSerializer(executionConfig)
         }
 
-        new CaseClassSerializer[(T1, T2)](classOf[(T1, T2)], fieldSerializers) {
-          override def createInstance(fields: Array[AnyRef]) = {
-            (fields(0).asInstanceOf[T1], fields(1).asInstanceOf[T2])
-          }
-        }
+        new Tuple2CaseClassSerializer[T1, T2](classOf[(T1, T2)], fieldSerializers)
       }
     }
+
+  class Tuple2CaseClassSerializer[T1, T2](
+      val clazz: Class[(T1, T2)],
+      fieldSerializers: Array[TypeSerializer[_]])
+    extends CaseClassSerializer[(T1, T2)](clazz, fieldSerializers) {
+
+    override def createInstance(fields: Array[AnyRef]) = {
+      (fields(0).asInstanceOf[T1], fields(1).asInstanceOf[T2])
+    }
+
+    override def createSerializerInstance(
+        tupleClass: Class[(T1, T2)],
+        fieldSerializers: Array[TypeSerializer[_]]) = {
+      new Tuple2CaseClassSerializer[T1, T2](tupleClass, fieldSerializers)
+    }
+  }
 }

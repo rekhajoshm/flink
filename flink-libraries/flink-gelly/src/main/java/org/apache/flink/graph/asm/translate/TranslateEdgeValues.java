@@ -21,11 +21,10 @@ package org.apache.flink.graph.asm.translate;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.graph.Edge;
 import org.apache.flink.graph.Graph;
-import org.apache.flink.graph.GraphAlgorithm;
+import org.apache.flink.graph.utils.proxy.GraphAlgorithmWrappingBase;
+import org.apache.flink.graph.utils.proxy.GraphAlgorithmWrappingGraph;
 import org.apache.flink.util.Preconditions;
 
-import static org.apache.flink.api.common.ExecutionConfig.PARALLELISM_DEFAULT;
-import static org.apache.flink.api.common.ExecutionConfig.PARALLELISM_UNKNOWN;
 import static org.apache.flink.graph.asm.translate.Translate.translateEdgeValues;
 
 /**
@@ -37,13 +36,10 @@ import static org.apache.flink.graph.asm.translate.Translate.translateEdgeValues
  * @param <NEW> new edge value type
  */
 public class TranslateEdgeValues<K, VV, OLD, NEW>
-implements GraphAlgorithm<K, VV, OLD, Graph<K, VV, NEW>> {
+extends GraphAlgorithmWrappingGraph<K, VV, OLD, K, VV, NEW> {
 
 	// Required configuration
-	private TranslateFunction<OLD,NEW> translator;
-
-	// Optional configuration
-	private int parallelism = PARALLELISM_UNKNOWN;
+	private TranslateFunction<OLD, NEW> translator;
 
 	/**
 	 * Translate {@link Edge} values using the given {@link TranslateFunction}.
@@ -56,23 +52,20 @@ implements GraphAlgorithm<K, VV, OLD, Graph<K, VV, NEW>> {
 		this.translator = translator;
 	}
 
-	/**
-	 * Override the operator parallelism.
-	 *
-	 * @param parallelism operator parallelism
-	 * @return this
-	 */
-	public TranslateEdgeValues<K, VV, OLD, NEW> setParallelism(int parallelism) {
-		Preconditions.checkArgument(parallelism > 0 || parallelism == PARALLELISM_DEFAULT || parallelism == PARALLELISM_UNKNOWN,
-			"The parallelism must be greater than zero.");
+	@Override
+	protected boolean canMergeConfigurationWith(GraphAlgorithmWrappingBase other) {
+		if (!super.canMergeConfigurationWith(other)) {
+			return false;
+		}
 
-		this.parallelism = parallelism;
+		TranslateEdgeValues rhs = (TranslateEdgeValues) other;
 
-		return this;
+		return translator == rhs.translator;
 	}
 
 	@Override
-	public Graph<K, VV, NEW> run(Graph<K, VV, OLD> input) throws Exception {
+	public Graph<K, VV, NEW> runInternal(Graph<K, VV, OLD> input)
+			throws Exception {
 		DataSet<Edge<K, NEW>> translatedEdges = translateEdgeValues(input.getEdges(), translator, parallelism);
 
 		return Graph.fromDataSet(input.getVertices(), translatedEdges, input.getContext());

@@ -19,8 +19,11 @@ c * Licensed to the Apache Software Foundation (ASF) under one
 package org.apache.flink.api.common.io;
 
 import org.apache.flink.annotation.Public;
+import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.core.io.InputSplit;
+
+import java.io.IOException;
 
 /**
  * An abstract stub implementation for Rich input formats.
@@ -55,8 +58,10 @@ public abstract class RichInputFormat<OT, T extends InputSplit> implements Input
 	 * Resources should be allocated in this method. (e.g. database connections, cache, etc.)
 	 * 
 	 * @see InputFormat
+	 * @throws IOException in case allocating the resources failed.
 	 */
-	public void openInputFormat() {
+	@PublicEvolving
+	public void openInputFormat() throws IOException {
 		//do nothing here, just for subclasses
 	}
 
@@ -65,8 +70,10 @@ public abstract class RichInputFormat<OT, T extends InputSplit> implements Input
 	 * Resources allocated during {@link #openInputFormat()} should be closed in this method.
 	 * 
 	 * @see InputFormat
+	 * @throws IOException in case closing the resources failed
 	 */
-	public void closeInputFormat() {
+	@PublicEvolving
+	public void closeInputFormat() throws IOException {
 		//do nothing here, just for subclasses
 	}
 }

@@ -18,23 +18,26 @@
 
 package org.apache.flink.runtime.jobmanager
 
+import java.util.concurrent.CompletableFuture
 
 import akka.actor.ActorSystem
 import akka.testkit.{ImplicitSender, TestKit}
 import akka.util.Timeout
-import org.apache.flink.api.common.{ExecutionConfig, JobID}
+import org.apache.flink.api.common.JobID
 import org.apache.flink.runtime.akka.ListeningBehaviour
-import org.apache.flink.runtime.checkpoint.{CheckpointCoordinator, SavepointCoordinator}
+import org.apache.flink.runtime.checkpoint._
 import org.apache.flink.runtime.client.JobExecutionException
-import org.apache.flink.runtime.jobgraph.tasks.JobSnapshottingSettings
+import org.apache.flink.runtime.io.network.partition.ResultPartitionType
+import org.apache.flink.runtime.jobgraph.tasks.{CheckpointCoordinatorConfiguration, JobCheckpointingSettings}
 import org.apache.flink.runtime.jobgraph.{DistributionPattern, JobGraph, JobVertex, ScheduleMode}
 import org.apache.flink.runtime.jobmanager.Tasks._
 import org.apache.flink.runtime.jobmanager.scheduler.{NoResourceAvailableException, SlotSharingGroup}
 import org.apache.flink.runtime.messages.JobManagerMessages._
 import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages._
 import org.apache.flink.runtime.testingUtils.{ScalaTestingUtils, TestingUtils}
-import org.apache.flink.runtime.testutils.JobManagerActorTestUtils
+import org.apache.flink.runtime.testtasks._
 import org.junit.runner.RunWith
+import org.mockito.Mockito
 import org.mockito.Mockito._
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpecLike}
@@ -179,7 +182,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise Job", sender, receiver)
 
@@ -214,7 +218,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Bipartite Job", sender, receiver)
 
@@ -250,8 +255,10 @@ class JobManagerITCase(_system: ActorSystem)
       sender2.setParallelism(2 * num_tasks)
       receiver.setParallelism(3 * num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender1, DistributionPattern.POINTWISE)
-      receiver.connectNewDataSetAsInput(sender2, DistributionPattern.ALL_TO_ALL)
+      receiver.connectNewDataSetAsInput(sender1, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
+      receiver.connectNewDataSetAsInput(sender2, DistributionPattern.ALL_TO_ALL,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Bipartite Job", sender1, receiver, sender2)
 
@@ -295,8 +302,10 @@ class JobManagerITCase(_system: ActorSystem)
       sender2.setParallelism(2 * num_tasks)
       receiver.setParallelism(3 * num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender1, DistributionPattern.POINTWISE)
-      receiver.connectNewDataSetAsInput(sender2, DistributionPattern.ALL_TO_ALL)
+      receiver.connectNewDataSetAsInput(sender1, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
+      receiver.connectNewDataSetAsInput(sender2, DistributionPattern.ALL_TO_ALL,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Bipartite Job", sender1, receiver, sender2)
 
@@ -337,12 +346,14 @@ class JobManagerITCase(_system: ActorSystem)
       forwarder.setSlotSharingGroup(sharingGroup)
       receiver.setSlotSharingGroup(sharingGroup)
 
-      forwarder.connectNewDataSetAsInput(sender, DistributionPattern.ALL_TO_ALL)
-      receiver.connectNewDataSetAsInput(forwarder, DistributionPattern.ALL_TO_ALL)
+      forwarder.connectNewDataSetAsInput(sender, DistributionPattern.ALL_TO_ALL,
+        ResultPartitionType.PIPELINED)
+      receiver.connectNewDataSetAsInput(forwarder, DistributionPattern.ALL_TO_ALL,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Forwarding Job", sender, forwarder, receiver)
 
-      jobGraph.setScheduleMode(ScheduleMode.ALL)
+      jobGraph.setScheduleMode(ScheduleMode.EAGER)
 
       val cluster = TestingUtils.startTestingCluster(num_tasks, 1)
       val jmGateway = cluster.getLeaderGateway(1 seconds)
@@ -374,7 +385,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise Job", sender, receiver)
 
@@ -422,7 +434,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise Job", sender, receiver)
 
@@ -467,7 +480,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise job", sender, receiver)
 
@@ -507,7 +521,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise job", sender, receiver)
 
@@ -555,7 +570,8 @@ class JobManagerITCase(_system: ActorSystem)
       sender.setParallelism(num_tasks)
       receiver.setParallelism(num_tasks)
 
-      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE)
+      receiver.connectNewDataSetAsInput(sender, DistributionPattern.POINTWISE,
+        ResultPartitionType.PIPELINED)
 
       val jobGraph = new JobGraph("Pointwise job", sender, receiver)
 
@@ -750,10 +766,15 @@ class JobManagerITCase(_system: ActorSystem)
           val jobManager = flinkCluster
             .getLeaderGateway(deadline.timeLeft)
 
+          // we have to make sure that the job manager knows also that he is the leader
+          // in case of standalone leader retrieval this can happen after the getLeaderGateway call
+          val leaderFuture = jobManager.ask(NotifyWhenLeader, timeout.duration)
+          Await.ready(leaderFuture, timeout.duration)
+
           val jobId = new JobID()
 
           // Trigger savepoint for non-existing job
-          jobManager.tell(TriggerSavepoint(jobId), testActor)
+          jobManager.tell(TriggerSavepoint(jobId, Option.apply("any")), testActor)
           val response = expectMsgType[TriggerSavepointFailure](deadline.timeLeft)
 
           // Verify the response
@@ -785,13 +806,13 @@ class JobManagerITCase(_system: ActorSystem)
           expectMsg(JobSubmitSuccess(jobGraph.getJobID()))
 
           // Trigger savepoint for job with disabled checkpointing
-          jobManager.tell(TriggerSavepoint(jobGraph.getJobID()), testActor)
+          jobManager.tell(TriggerSavepoint(jobGraph.getJobID(), Option.apply("any")), testActor)
           val response = expectMsgType[TriggerSavepointFailure](deadline.timeLeft)
 
           // Verify the response
           response.jobId should equal(jobGraph.getJobID())
           response.cause.getClass should equal(classOf[IllegalStateException])
-          response.cause.getMessage should (include("disabled") or include("configured"))
+          response.cause.getMessage should include("not a streaming job")
         }
       }
       finally {
@@ -812,11 +833,18 @@ class JobManagerITCase(_system: ActorSystem)
           val jobVertex = new JobVertex("Blocking vertex")
           jobVertex.setInvokableClass(classOf[BlockingNoOpInvokable])
           val jobGraph = new JobGraph(jobVertex)
-          jobGraph.setSnapshotSettings(new JobSnapshottingSettings(
+          jobGraph.setSnapshotSettings(new JobCheckpointingSettings(
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
-            60000, 60000, 60000, 1))
+            new CheckpointCoordinatorConfiguration(
+              60000,
+              60000,
+              60000,
+              1,
+              CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,
+              true),
+            null))
 
           // Submit job...
           jobManager.tell(SubmitJob(jobGraph, ListeningBehaviour.DETACHED), testActor)
@@ -828,22 +856,23 @@ class JobManagerITCase(_system: ActorSystem)
             deadline.timeLeft).executionGraph
 
           // Mock the checkpoint coordinator
-          val savepointCoordinator = mock(classOf[SavepointCoordinator])
-          doThrow(new Exception("Expected Test Exception"))
-            .when(savepointCoordinator).triggerSavepoint(org.mockito.Matchers.anyLong())
+          val checkpointCoordinator = mock(classOf[CheckpointCoordinator])
+          doThrow(new IllegalStateException("Expected Test Exception"))
+            .when(checkpointCoordinator)
+            .triggerSavepoint(org.mockito.Matchers.anyLong(), org.mockito.Matchers.anyString())
 
           // Update the savepoint coordinator field
-          val field = executionGraph.getClass.getDeclaredField("savepointCoordinator")
+          val field = executionGraph.getClass.getDeclaredField("checkpointCoordinator")
           field.setAccessible(true)
-          field.set(executionGraph, savepointCoordinator)
+          field.set(executionGraph, checkpointCoordinator)
 
           // Trigger savepoint for job
-          jobManager.tell(TriggerSavepoint(jobGraph.getJobID()), testActor)
+          jobManager.tell(TriggerSavepoint(jobGraph.getJobID(), Option.apply("any")), testActor)
           val response = expectMsgType[TriggerSavepointFailure](deadline.timeLeft)
 
           // Verify the response
           response.jobId should equal(jobGraph.getJobID())
-          response.cause.getCause.getClass should equal(classOf[Exception])
+          response.cause.getCause.getClass should equal(classOf[IllegalStateException])
           response.cause.getCause.getMessage should equal("Expected Test Exception")
         }
       }
@@ -852,7 +881,7 @@ class JobManagerITCase(_system: ActorSystem)
       }
     }
 
-    "handle trigger savepoint response after failed savepoint future" in {
+    "handle failed savepoint triggering" in {
       val deadline = TestingUtils.TESTING_DURATION.fromNow
 
       val flinkCluster = TestingUtils.startTestingCluster(1, 1)
@@ -865,21 +894,32 @@ class JobManagerITCase(_system: ActorSystem)
           val jobVertex = new JobVertex("Blocking vertex")
           jobVertex.setInvokableClass(classOf[BlockingNoOpInvokable])
           val jobGraph = new JobGraph(jobVertex)
-          jobGraph.setSnapshotSettings(new JobSnapshottingSettings(
+          jobGraph.setSnapshotSettings(new JobCheckpointingSettings(
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
-            60000, 60000, 60000, 1))
+            new CheckpointCoordinatorConfiguration(
+              60000,
+              60000,
+              60000,
+              1,
+              CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,
+              true),
+            null))
 
           // Submit job...
           jobManager.tell(SubmitJob(jobGraph, ListeningBehaviour.DETACHED), testActor)
           expectMsg(JobSubmitSuccess(jobGraph.getJobID()))
 
           // Mock the checkpoint coordinator
-          val savepointCoordinator = mock(classOf[SavepointCoordinator])
-          val savepointPathPromise = scala.concurrent.promise[String]
-          doReturn(savepointPathPromise.future)
-            .when(savepointCoordinator).triggerSavepoint(org.mockito.Matchers.anyLong())
+          val checkpointCoordinator = mock(classOf[CheckpointCoordinator])
+          doThrow(new IllegalStateException("Expected Test Exception"))
+            .when(checkpointCoordinator)
+            .triggerSavepoint(org.mockito.Matchers.anyLong(), org.mockito.Matchers.anyString())
+          val savepointPathPromise = new CompletableFuture[CompletedCheckpoint]()
+          doReturn(savepointPathPromise)
+            .when(checkpointCoordinator)
+            .triggerSavepoint(org.mockito.Matchers.anyLong(), org.mockito.Matchers.anyString())
 
           // Request the execution graph and set a checkpoint coordinator mock
           jobManager.tell(RequestExecutionGraph(jobGraph.getJobID), testActor)
@@ -887,15 +927,15 @@ class JobManagerITCase(_system: ActorSystem)
             deadline.timeLeft).executionGraph
 
           // Update the savepoint coordinator field
-          val field = executionGraph.getClass.getDeclaredField("savepointCoordinator")
+          val field = executionGraph.getClass.getDeclaredField("checkpointCoordinator")
           field.setAccessible(true)
-          field.set(executionGraph, savepointCoordinator)
+          field.set(executionGraph, checkpointCoordinator)
 
           // Trigger savepoint for job
-          jobManager.tell(TriggerSavepoint(jobGraph.getJobID()), testActor)
+          jobManager.tell(TriggerSavepoint(jobGraph.getJobID(), Option.apply("any")), testActor)
 
           // Fail the promise
-          savepointPathPromise.failure(new Exception("Expected Test Exception"))
+          savepointPathPromise.completeExceptionally(new Exception("Expected Test Exception"))
 
           val response = expectMsgType[TriggerSavepointFailure](deadline.timeLeft)
 
@@ -923,21 +963,33 @@ class JobManagerITCase(_system: ActorSystem)
           val jobVertex = new JobVertex("Blocking vertex")
           jobVertex.setInvokableClass(classOf[BlockingNoOpInvokable])
           val jobGraph = new JobGraph(jobVertex)
-          jobGraph.setSnapshotSettings(new JobSnapshottingSettings(
+          jobGraph.setSnapshotSettings(new JobCheckpointingSettings(
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
             java.util.Collections.emptyList(),
-            60000, 60000, 60000, 1))
+            new CheckpointCoordinatorConfiguration(
+              60000,
+              60000,
+              60000,
+              1,
+              CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,
+              true),
+            null))
 
           // Submit job...
           jobManager.tell(SubmitJob(jobGraph, ListeningBehaviour.DETACHED), testActor)
           expectMsg(JobSubmitSuccess(jobGraph.getJobID()))
 
           // Mock the checkpoint coordinator
-          val savepointCoordinator = mock(classOf[SavepointCoordinator])
-          val savepointPathPromise = scala.concurrent.promise[String]
-          doReturn(savepointPathPromise.future)
-            .when(savepointCoordinator).triggerSavepoint(org.mockito.Matchers.anyLong())
+          val checkpointCoordinator = mock(classOf[CheckpointCoordinator])
+          doThrow(new IllegalStateException("Expected Test Exception"))
+            .when(checkpointCoordinator)
+            .triggerSavepoint(org.mockito.Matchers.anyLong(), org.mockito.Matchers.anyString())
+
+          val savepointPromise = new CompletableFuture[CompletedCheckpoint]()
+          doReturn(savepointPromise)
+            .when(checkpointCoordinator)
+            .triggerSavepoint(org.mockito.Matchers.anyLong(), org.mockito.Matchers.anyString())
 
           // Request the execution graph and set a checkpoint coordinator mock
           jobManager.tell(RequestExecutionGraph(jobGraph.getJobID), testActor)
@@ -945,15 +997,18 @@ class JobManagerITCase(_system: ActorSystem)
             deadline.timeLeft).executionGraph
 
           // Update the savepoint coordinator field
-          val field = executionGraph.getClass.getDeclaredField("savepointCoordinator")
+          val field = executionGraph.getClass.getDeclaredField("checkpointCoordinator")
           field.setAccessible(true)
-          field.set(executionGraph, savepointCoordinator)
+          field.set(executionGraph, checkpointCoordinator)
 
           // Trigger savepoint for job
-          jobManager.tell(TriggerSavepoint(jobGraph.getJobID()), testActor)
+          jobManager.tell(TriggerSavepoint(jobGraph.getJobID(), Option.apply("any")), testActor)
+
+          val checkpoint = Mockito.mock(classOf[CompletedCheckpoint])
+          when(checkpoint.getExternalPointer).thenReturn("Expected test savepoint path")
 
           // Succeed the promise
-          savepointPathPromise.success("Expected test savepoint path")
+          savepointPromise.complete(checkpoint)
 
           val response = expectMsgType[TriggerSavepointSuccess](deadline.timeLeft)
 

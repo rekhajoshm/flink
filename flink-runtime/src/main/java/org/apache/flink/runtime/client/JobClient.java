@@ -18,43 +18,50 @@
 
 package org.apache.flink.runtime.client;
 
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.runtime.akka.ListeningBehaviour;
+import org.apache.flink.runtime.blob.PermanentBlobCache;
+import org.apache.flink.runtime.blob.PermanentBlobKey;
+import org.apache.flink.runtime.clusterframework.BootstrapTools;
+import org.apache.flink.runtime.execution.librarycache.FlinkUserCodeClassLoaders;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobmaster.JobManagerGateway;
+import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.runtime.messages.JobClientMessages;
+import org.apache.flink.runtime.messages.JobManagerMessages;
+import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.SerializedThrowable;
+
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
-import akka.actor.Address;
+import akka.actor.Identify;
 import akka.actor.PoisonPill;
 import akka.actor.Props;
 import akka.pattern.Patterns;
 import akka.util.Timeout;
-
-import org.apache.flink.api.common.JobExecutionResult;
-import org.apache.flink.api.common.JobID;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.akka.AkkaUtils;
-import org.apache.flink.runtime.akka.ListeningBehaviour;
-import org.apache.flink.runtime.instance.ActorGateway;
-import org.apache.flink.runtime.jobgraph.JobGraph;
-import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
-import org.apache.flink.runtime.messages.JobClientMessages;
-import org.apache.flink.runtime.messages.JobManagerMessages;
-import org.apache.flink.runtime.util.SerializedThrowable;
-
-import org.apache.flink.util.NetUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import scala.Option;
-import scala.Some;
-import scala.Tuple2;
-import scala.concurrent.Await;
-import scala.concurrent.Future;
-import scala.concurrent.duration.FiniteDuration;
-
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.URL;
+import java.util.Collection;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import static com.google.common.base.Preconditions.checkNotNull;
+import scala.concurrent.Await;
+import scala.concurrent.Future;
+import scala.concurrent.duration.Duration;
+import scala.concurrent.duration.FiniteDuration;
+
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * The JobClient bridges between the JobManager's asynchronous actor messages and
@@ -64,51 +71,33 @@ public class JobClient {
 
 	private static final Logger LOG = LoggerFactory.getLogger(JobClient.class);
 
-
-	public static ActorSystem startJobClientActorSystem(Configuration config)
-			throws IOException {
+	public static ActorSystem startJobClientActorSystem(Configuration config, String hostname)
+			throws Exception {
 		LOG.info("Starting JobClient actor system");
-		Option<Tuple2<String, Object>> remoting = new Some<>(new Tuple2<String, Object>("", 0));
 
 		// start a remote actor system to listen on an arbitrary port
-		ActorSystem system = AkkaUtils.createActorSystem(config, remoting);
-		Address address = system.provider().getDefaultAddress();
-
-		String hostAddress = address.host().isDefined() ?
-				NetUtils.ipAddressToUrlString(InetAddress.getByName(address.host().get())) :
-				"(unknown)";
-		int port = address.port().isDefined() ? ((Integer) address.port().get()) : -1;
-		LOG.info("Started JobClient actor system at " + hostAddress + ':' + port);
+		ActorSystem system = BootstrapTools.startActorSystem(config, hostname, 0, LOG);
 
 		return system;
 	}
 
 	/**
-	 * Sends a [[JobGraph]] to the JobClient actor specified by jobClient which submits it then to
-	 * the JobManager. The method blocks until the job has finished or the JobManager is no longer
-	 * alive. In the former case, the [[SerializedJobExecutionResult]] is returned and in the latter
-	 * case a [[JobExecutionException]] is thrown.
-	 *
-	 * @param actorSystem The actor system that performs the communication.
-	 * @param leaderRetrievalService Leader retrieval service which used to find the current leading
-	 *                               JobManager
-	 * @param jobGraph    JobGraph describing the Flink job
-	 * @param timeout     Timeout for futures
-	 * @param sysoutLogUpdates prints log updates to system out if true
-	 * @return The job execution result
-	 * @throws org.apache.flink.runtime.client.JobExecutionException Thrown if the job
-	 *                                                               execution fails.
+	 * Submits a job to a Flink cluster (non-blocking) and returns a JobListeningContext which can be
+	 * passed to {@code awaitJobResult} to get the result of the submission.
+	 * @return JobListeningContext which may be used to retrieve the JobExecutionResult via
+	 * 			{@code awaitJobResult(JobListeningContext context)}.
 	 */
-	public static JobExecutionResult submitJobAndWait(
+	public static JobListeningContext submitJob(
 			ActorSystem actorSystem,
-			LeaderRetrievalService leaderRetrievalService,
+			Configuration config,
+			HighAvailabilityServices highAvailabilityServices,
 			JobGraph jobGraph,
 			FiniteDuration timeout,
 			boolean sysoutLogUpdates,
-			ClassLoader classLoader) throws JobExecutionException {
+			ClassLoader classLoader) {
 
 		checkNotNull(actorSystem, "The actorSystem must not be null.");
-		checkNotNull(leaderRetrievalService, "The jobManagerGateway must not be null.");
+		checkNotNull(highAvailabilityServices, "The high availability services must not be null.");
 		checkNotNull(jobGraph, "The jobGraph must not be null.");
 		checkNotNull(timeout, "The timeout must not be null.");
 
@@ -116,29 +105,200 @@ public class JobClient {
 		// the JobManager. It forwards the job submission, checks the success/failure responses, logs
 		// update messages, watches for disconnect between client and JobManager, ...
 
-		Props jobClientActorProps = JobClientActor.createJobClientActorProps(
-			leaderRetrievalService,
+		Props jobClientActorProps = JobSubmissionClientActor.createActorProps(
+			highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
+			timeout,
+			sysoutLogUpdates,
+			config);
+
+		ActorRef jobClientActor = actorSystem.actorOf(jobClientActorProps);
+
+		Future<Object> submissionFuture = Patterns.ask(
+				jobClientActor,
+				new JobClientMessages.SubmitJobAndWait(jobGraph),
+				new Timeout(AkkaUtils.INF_TIMEOUT()));
+
+		return new JobListeningContext(
+			jobGraph.getJobID(),
+			submissionFuture,
+			jobClientActor,
+			timeout,
+			classLoader,
+			highAvailabilityServices);
+	}
+
+
+	/**
+	 * Attaches to a running Job using the JobID.
+	 * Reconstructs the user class loader by downloading the jars from the JobManager.
+	 */
+	public static JobListeningContext attachToRunningJob(
+			JobID jobID,
+			Configuration configuration,
+			ActorSystem actorSystem,
+			HighAvailabilityServices highAvailabilityServices,
+			FiniteDuration timeout,
+			boolean sysoutLogUpdates) {
+
+		checkNotNull(jobID, "The jobID must not be null.");
+		checkNotNull(configuration, "The configuration must not be null.");
+		checkNotNull(actorSystem, "The actorSystem must not be null.");
+		checkNotNull(highAvailabilityServices, "The high availability services must not be null.");
+		checkNotNull(timeout, "The timeout must not be null.");
+
+		// we create a proxy JobClientActor that deals with all communication with
+		// the JobManager. It forwards the job attachments, checks the success/failure responses, logs
+		// update messages, watches for disconnect between client and JobManager, ...
+		Props jobClientActorProps = JobAttachmentClientActor.createActorProps(
+			highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
 			timeout,
 			sysoutLogUpdates);
 
 		ActorRef jobClientActor = actorSystem.actorOf(jobClientActorProps);
-		
-		// first block handles errors while waiting for the result
-		Object answer;
+
+		Future<Object> attachmentFuture = Patterns.ask(
+				jobClientActor,
+				new JobClientMessages.AttachToJobAndWait(jobID),
+				new Timeout(AkkaUtils.INF_TIMEOUT()));
+
+		return new JobListeningContext(
+			jobID,
+			attachmentFuture,
+			jobClientActor,
+			timeout,
+			actorSystem,
+			configuration,
+			highAvailabilityServices);
+	}
+
+	/**
+	 * Reconstructs the class loader by first requesting information about it at the JobManager
+	 * and then downloading missing jar files.
+	 * @param jobID id of job
+	 * @param jobManager gateway to the JobManager
+	 * @param config the flink configuration
+	 * @return A classloader that should behave like the original classloader
+	 * @throws JobRetrievalException if anything goes wrong
+	 */
+	public static ClassLoader retrieveClassLoader(
+			JobID jobID,
+			JobManagerGateway jobManager,
+			Configuration config,
+			HighAvailabilityServices highAvailabilityServices,
+			Time timeout)
+		throws JobRetrievalException {
+
+		final CompletableFuture<Optional<JobManagerMessages.ClassloadingProps>> clPropsFuture = jobManager
+			.requestClassloadingProps(jobID, timeout);
+
+		final Optional<JobManagerMessages.ClassloadingProps> optProps;
+
 		try {
-			Future<Object> future = Patterns.ask(jobClientActor,
-					new JobClientMessages.SubmitJobAndWait(jobGraph),
-					new Timeout(AkkaUtils.INF_TIMEOUT()));
-			
-			answer = Await.result(future, AkkaUtils.INF_TIMEOUT());
+			optProps = clPropsFuture.get(timeout.toMilliseconds(), TimeUnit.MILLISECONDS);
+		} catch (Exception e) {
+			throw new JobRetrievalException(jobID, "Could not retrieve the class loading properties from JobManager.", e);
 		}
-		catch (TimeoutException e) {
-			throw new JobTimeoutException(jobGraph.getJobID(), "Timeout while waiting for JobManager answer. " +
-					"Job time exceeded " + AkkaUtils.INF_TIMEOUT(), e);
+
+		if (optProps.isPresent()) {
+			JobManagerMessages.ClassloadingProps props = optProps.get();
+
+			InetSocketAddress serverAddress = new InetSocketAddress(jobManager.getHostname(), props.blobManagerPort());
+			final PermanentBlobCache permanentBlobCache;
+			try {
+				// TODO: Fix lifecycle of PermanentBlobCache to properly close it upon usage
+				permanentBlobCache = new PermanentBlobCache(config, highAvailabilityServices.createBlobStore(), serverAddress);
+			} catch (IOException e) {
+				throw new JobRetrievalException(
+					jobID,
+					"Failed to setup BlobCache.",
+					e);
+			}
+
+			final Collection<PermanentBlobKey> requiredJarFiles = props.requiredJarFiles();
+			final Collection<URL> requiredClasspaths = props.requiredClasspaths();
+
+			final URL[] allURLs = new URL[requiredJarFiles.size() + requiredClasspaths.size()];
+
+			int pos = 0;
+			for (PermanentBlobKey blobKey : props.requiredJarFiles()) {
+				try {
+					allURLs[pos++] = permanentBlobCache.getFile(jobID, blobKey).toURI().toURL();
+				} catch (Exception e) {
+					try {
+						permanentBlobCache.close();
+					} catch (IOException ioe) {
+						LOG.warn("Could not properly close the BlobClient.", ioe);
+					}
+
+					throw new JobRetrievalException(jobID, "Failed to download BlobKey " + blobKey, e);
+				}
+			}
+
+			for (URL url : requiredClasspaths) {
+				allURLs[pos++] = url;
+			}
+
+			return FlinkUserCodeClassLoaders.parentFirst(allURLs, JobClient.class.getClassLoader());
+		} else {
+			throw new JobRetrievalException(jobID, "Couldn't retrieve class loader. Job " + jobID + " not found");
+		}
+	}
+
+	/**
+	 * Given a JobListeningContext, awaits the result of the job execution that this context is bound to
+	 * @param listeningContext The listening context of the job execution
+	 * @return The result of the execution
+	 * @throws JobExecutionException if anything goes wrong while monitoring the job
+	 */
+	public static JobExecutionResult awaitJobResult(JobListeningContext listeningContext) throws JobExecutionException {
+
+		final JobID jobID = listeningContext.getJobID();
+		final ActorRef jobClientActor = listeningContext.getJobClientActor();
+		final Future<Object> jobSubmissionFuture = listeningContext.getJobResultFuture();
+		final FiniteDuration askTimeout = listeningContext.getTimeout();
+		// retrieves class loader if necessary
+		final ClassLoader classLoader = listeningContext.getClassLoader();
+
+		// wait for the future which holds the result to be ready
+		// ping the JobClientActor from time to time to check if it is still running
+		while (!jobSubmissionFuture.isCompleted()) {
+			try {
+				Await.ready(jobSubmissionFuture, askTimeout);
+			} catch (InterruptedException e) {
+				throw new JobExecutionException(
+					jobID,
+					"Interrupted while waiting for job completion.");
+			} catch (TimeoutException e) {
+				try {
+					Await.result(
+						Patterns.ask(
+							jobClientActor,
+							// Ping the Actor to see if it is alive
+							new Identify(true),
+							Timeout.durationToTimeout(askTimeout)),
+						askTimeout);
+					// we got a reply, continue waiting for the job result
+				} catch (Exception eInner) {
+					// we could have a result but the JobClientActor might have been killed and
+					// thus the health check failed
+					if (!jobSubmissionFuture.isCompleted()) {
+						throw new JobExecutionException(
+							jobID,
+							"JobClientActor seems to have died before the JobExecutionResult could be retrieved.",
+							eInner);
+					}
+				}
+			}
+		}
+
+		final Object answer;
+		try {
+			// we have already awaited the result, zero time to wait here
+			answer = Await.result(jobSubmissionFuture, Duration.Zero());
 		}
 		catch (Throwable throwable) {
-			throw new JobExecutionException(jobGraph.getJobID(),
-					"Communication with JobManager failed: " + throwable.getMessage(), throwable);
+			throw new JobExecutionException(jobID,
+				"Couldn't retrieve the JobExecutionResult from the JobManager.", throwable);
 		}
 		finally {
 			// failsafe shutdown of the client actor
@@ -153,18 +313,16 @@ public class JobClient {
 			if (result != null) {
 				try {
 					return result.toJobExecutionResult(classLoader);
+				} catch (Throwable t) {
+					throw new JobExecutionException(jobID,
+						"Job was successfully executed but JobExecutionResult could not be deserialized.");
 				}
-				catch (Throwable t) {
-					throw new JobExecutionException(jobGraph.getJobID(),
-							"Job was successfully executed but JobExecutionResult could not be deserialized.");
-				}
-			}
-			else {
-				throw new JobExecutionException(jobGraph.getJobID(),
-						"Job was successfully executed but result contained a null JobExecutionResult.");
+			} else {
+				throw new JobExecutionException(jobID,
+					"Job was successfully executed but result contained a null JobExecutionResult.");
 			}
 		}
-		if (answer instanceof JobManagerMessages.JobResultFailure) {
+		else if (answer instanceof JobManagerMessages.JobResultFailure) {
 			LOG.info("Job execution failed");
 
 			SerializedThrowable serThrowable = ((JobManagerMessages.JobResultFailure) answer).cause();
@@ -172,20 +330,61 @@ public class JobClient {
 				Throwable cause = serThrowable.deserializeError(classLoader);
 				if (cause instanceof JobExecutionException) {
 					throw (JobExecutionException) cause;
+				} else {
+					throw new JobExecutionException(jobID, "Job execution failed", cause);
 				}
-				else {
-					throw new JobExecutionException(jobGraph.getJobID(), "Job execution failed", cause);
-				}
+			} else {
+				throw new JobExecutionException(jobID,
+					"Job execution failed with null as failure cause.");
 			}
-			else {
-				throw new JobExecutionException(jobGraph.getJobID(),
-						"Job execution failed with null as failure cause.");
-			}
+		}
+		else if (answer instanceof JobManagerMessages.JobNotFound) {
+			throw new JobRetrievalException(
+				((JobManagerMessages.JobNotFound) answer).jobID(),
+				"Couldn't retrieve Job " + jobID + " because it was not running.");
 		}
 		else {
-			throw new JobExecutionException(jobGraph.getJobID(),
-					"Unknown answer from JobManager after submitting the job: " + answer);
+			throw new JobExecutionException(jobID,
+				"Unknown answer from JobManager after submitting the job: " + answer);
 		}
+	}
+
+	/**
+	 * Sends a [[JobGraph]] to the JobClient actor specified by jobClient which submits it then to
+	 * the JobManager. The method blocks until the job has finished or the JobManager is no longer
+	 * alive. In the former case, the [[SerializedJobExecutionResult]] is returned and in the latter
+	 * case a [[JobExecutionException]] is thrown.
+	 *
+	 * @param actorSystem The actor system that performs the communication.
+	 * @param config The cluster wide configuration.
+	 * @param highAvailabilityServices Service factory for high availability services
+	 * @param jobGraph    JobGraph describing the Flink job
+	 * @param timeout     Timeout for futures
+	 * @param sysoutLogUpdates prints log updates to system out if true
+	 * @param classLoader The class loader for deserializing the results
+	 * @return The job execution result
+	 * @throws JobExecutionException Thrown if the job
+	 *                                                               execution fails.
+	 */
+	public static JobExecutionResult submitJobAndWait(
+			ActorSystem actorSystem,
+			Configuration config,
+			HighAvailabilityServices highAvailabilityServices,
+			JobGraph jobGraph,
+			FiniteDuration timeout,
+			boolean sysoutLogUpdates,
+			ClassLoader classLoader) throws JobExecutionException {
+
+		JobListeningContext jobListeningContext = submitJob(
+				actorSystem,
+				config,
+				highAvailabilityServices,
+				jobGraph,
+				timeout,
+				sysoutLogUpdates,
+				classLoader);
+
+		return awaitJobResult(jobListeningContext);
 	}
 
 	/**
@@ -193,103 +392,89 @@ public class JobClient {
 	 * JobManager and waits for the answer whether the job could be started or not.
 	 *
 	 * @param jobManagerGateway Gateway to the JobManager which will execute the jobs
+	 * @param config The cluster wide configuration.
 	 * @param jobGraph The job
-	 * @param timeout  Timeout in which the JobManager must have responded.
+	 * @param timeout Timeout in which the JobManager must have responded.
 	 */
 	public static void submitJobDetached(
-			ActorGateway jobManagerGateway,
+			JobManagerGateway jobManagerGateway,
+			Configuration config,
 			JobGraph jobGraph,
-			FiniteDuration timeout,
+			Time timeout,
 			ClassLoader classLoader) throws JobExecutionException {
 
 		checkNotNull(jobManagerGateway, "The jobManagerGateway must not be null.");
 		checkNotNull(jobGraph, "The jobGraph must not be null.");
 		checkNotNull(timeout, "The timeout must not be null.");
-		
-		Object result;
+
+		LOG.info("Checking and uploading JAR files");
+
+		final CompletableFuture<InetSocketAddress> blobServerAddressFuture = retrieveBlobServerAddress(
+			jobManagerGateway,
+			timeout);
+
+		final InetSocketAddress blobServerAddress;
+
 		try {
-			Future<Object> future = jobManagerGateway.ask(
-				new JobManagerMessages.SubmitJob(
-					jobGraph,
-					ListeningBehaviour.DETACHED // only receive the Acknowledge for the job submission message
-				),
-				timeout);
-			
-			result = Await.result(future, timeout);
+			blobServerAddress = blobServerAddressFuture.get(timeout.toMilliseconds(), TimeUnit.MILLISECONDS);
+		} catch (Exception e) {
+			throw new JobSubmissionException(jobGraph.getJobID(), "Could not retrieve BlobServer address.", e);
 		}
-		catch (TimeoutException e) {
+
+		try {
+			jobGraph.uploadUserJars(blobServerAddress, config);
+		}
+		catch (IOException e) {
+			throw new JobSubmissionException(jobGraph.getJobID(),
+				"Could not upload the program's JAR files to the JobManager.", e);
+		}
+
+		try {
+			jobGraph.uploadUserArtifacts(blobServerAddress, config);
+		} catch (IOException e) {
+			throw new JobSubmissionException(jobGraph.getJobID(),
+					"Could not upload custom user artifacts to the job manager.", e);
+		}
+
+		CompletableFuture<Acknowledge> submissionFuture = jobManagerGateway.submitJob(jobGraph, ListeningBehaviour.DETACHED, timeout);
+
+		try {
+			submissionFuture.get(timeout.toMilliseconds(), TimeUnit.MILLISECONDS);
+		} catch (TimeoutException e) {
 			throw new JobTimeoutException(jobGraph.getJobID(),
-					"JobManager did not respond within " + timeout.toString(), e);
-		}
-		catch (Throwable t) {
-			throw new JobExecutionException(jobGraph.getJobID(),
-					"Failed to send job to JobManager: " + t.getMessage(), t.getCause());
-		}
-		
-		if (result instanceof JobManagerMessages.JobSubmitSuccess) {
-			JobID respondedID = ((JobManagerMessages.JobSubmitSuccess) result).jobId();
-			
-			// validate response
-			if (!respondedID.equals(jobGraph.getJobID())) {
-				throw new JobExecutionException(jobGraph.getJobID(),
-						"JobManager responded for wrong Job. This Job: " +
-						jobGraph.getJobID() + ", response: " + respondedID);
-			}
-		}
-		else if (result instanceof JobManagerMessages.JobResultFailure) {
+				"JobManager did not respond within " + timeout, e);
+		} catch (Throwable throwable) {
+			Throwable stripped = ExceptionUtils.stripExecutionException(throwable);
+
 			try {
-				SerializedThrowable t = ((JobManagerMessages.JobResultFailure) result).cause();
-				throw t.deserializeError(classLoader);
+				ExceptionUtils.tryDeserializeAndThrow(stripped, classLoader);
+			} catch (JobExecutionException jee) {
+				throw jee;
+			} catch (Throwable t) {
+				throw new JobExecutionException(
+					jobGraph.getJobID(),
+					"JobSubmission failed.",
+					t);
 			}
-			catch (JobExecutionException e) {
-				throw e;
-			}
-			catch (Throwable t) {
-				throw new JobExecutionException(jobGraph.getJobID(),
-						"JobSubmission failed: " + t.getMessage(), t);
-			}
-		}
-		else {
-			throw new JobExecutionException(jobGraph.getJobID(), "Unexpected response from JobManager: " + result);
 		}
 	}
 
 	/**
-	 * Uploads the specified jar files of the [[JobGraph]] jobGraph to the BlobServer of the
-	 * JobManager. The respective port is retrieved from the JobManager. This function issues a
-	 * blocking call.
+	 * Utility method to retrieve the BlobServer address from the given JobManager gateway.
 	 *
-	 * @param jobGraph   Flink job containing the information about the required jars
-	 * @param jobManagerGateway Gateway to the JobManager.
-	 * @param timeout    Timeout for futures
-	 * @throws IOException Thrown, if the file upload to the JobManager failed.
+	 * @param jobManagerGateway to obtain the BlobServer address from
+	 * @param timeout for this operation
+	 * @return CompletableFuture containing the BlobServer address
 	 */
-	public static void uploadJarFiles(JobGraph jobGraph, ActorGateway jobManagerGateway, FiniteDuration timeout)
-			throws IOException {
-		
-		if (jobGraph.hasUsercodeJarFiles()) {
-			Future<Object> futureBlobPort = jobManagerGateway.ask(
-					JobManagerMessages.getRequestBlobManagerPort(),
-					timeout);
+	public static CompletableFuture<InetSocketAddress> retrieveBlobServerAddress(
+			JobManagerGateway jobManagerGateway,
+			Time timeout) {
 
-			int port;
-			try {
-				Object result = Await.result(futureBlobPort, timeout);
-				if (result instanceof Integer) {
-					port = (Integer) result;
-				} else {
-					throw new Exception("Expected port number (int) as answer, received " + result);
-				}
-			}
-			catch (Exception e) {
-				throw new IOException("Could not retrieve the JobManager's blob port.", e);
-			}
+		CompletableFuture<Integer> futureBlobPort = jobManagerGateway.requestBlobServerPort(timeout);
 
-			Option<String> jmHost = jobManagerGateway.actor().path().address().host();
-			String jmHostname = jmHost.isDefined() ? jmHost.get() : "localhost";
-			InetSocketAddress serverAddress = new InetSocketAddress(jmHostname, port);
+		final String jmHostname = jobManagerGateway.getHostname();
 
-			jobGraph.uploadRequiredJarFiles(serverAddress);
-		}
+		return futureBlobPort.thenApply(
+			(Integer blobPort) -> new InetSocketAddress(jmHostname, blobPort));
 	}
 }

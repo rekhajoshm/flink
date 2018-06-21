@@ -25,6 +25,7 @@ import org.apache.flink.api.common.Plan;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.optimizer.plan.OptimizedPlan;
 import org.apache.flink.optimizer.plandump.PlanJSONDumpGenerator;
+import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 
 import java.net.URL;
 import java.util.List;
@@ -34,23 +35,23 @@ import java.util.List;
  */
 public class ContextEnvironment extends ExecutionEnvironment {
 
-	protected final Client client;
+	protected final ClusterClient<?> client;
 
 	protected final List<URL> jarFilesToAttach;
 
 	protected final List<URL> classpathsToAttach;
-	
+
 	protected final ClassLoader userCodeClassLoader;
 
-	protected final String savepointPath;
-	
-	public ContextEnvironment(Client remoteConnection, List<URL> jarFiles, List<URL> classpaths,
-			ClassLoader userCodeClassLoader, String savepointPath) {
+	protected final SavepointRestoreSettings savepointSettings;
+
+	public ContextEnvironment(ClusterClient<?> remoteConnection, List<URL> jarFiles, List<URL> classpaths,
+				ClassLoader userCodeClassLoader, SavepointRestoreSettings savepointSettings) {
 		this.client = remoteConnection;
 		this.jarFilesToAttach = jarFiles;
 		this.classpathsToAttach = classpaths;
 		this.userCodeClassLoader = userCodeClassLoader;
-		this.savepointPath = savepointPath;
+		this.savepointSettings = savepointSettings;
 	}
 
 	@Override
@@ -58,7 +59,7 @@ public class ContextEnvironment extends ExecutionEnvironment {
 		Plan p = createProgramPlan(jobName);
 		JobWithJars toRun = new JobWithJars(p, this.jarFilesToAttach, this.classpathsToAttach,
 				this.userCodeClassLoader);
-		this.lastJobExecutionResult = client.runBlocking(toRun, getParallelism(), savepointPath);
+		this.lastJobExecutionResult = client.run(toRun, getParallelism(), savepointSettings).getJobExecutionResult();
 		return this.lastJobExecutionResult;
 	}
 
@@ -66,7 +67,7 @@ public class ContextEnvironment extends ExecutionEnvironment {
 	public String getExecutionPlan() throws Exception {
 		Plan plan = createProgramPlan("unnamed job");
 
-		OptimizedPlan op = Client.getOptimizedPlan(client.compiler, plan, getParallelism());
+		OptimizedPlan op = ClusterClient.getOptimizedPlan(client.compiler, plan, getParallelism());
 		PlanJSONDumpGenerator gen = new PlanJSONDumpGenerator();
 		return gen.getOptimizerPlanAsJSON(op);
 	}
@@ -82,11 +83,11 @@ public class ContextEnvironment extends ExecutionEnvironment {
 		return "Context Environment (parallelism = " + (getParallelism() == ExecutionConfig.PARALLELISM_DEFAULT ? "default" : getParallelism())
 				+ ") : " + getIdString();
 	}
-	
-	public Client getClient() {
+
+	public ClusterClient<?> getClient() {
 		return this.client;
 	}
-	
+
 	public List<URL> getJars(){
 		return jarFilesToAttach;
 	}
@@ -99,16 +100,16 @@ public class ContextEnvironment extends ExecutionEnvironment {
 		return userCodeClassLoader;
 	}
 
-	public String getSavepointPath() {
-		return savepointPath;
+	public SavepointRestoreSettings getSavepointRestoreSettings() {
+		return savepointSettings;
 	}
 
 	// --------------------------------------------------------------------------------------------
-	
+
 	static void setAsContext(ContextEnvironmentFactory factory) {
 		initializeContextEnvironment(factory);
 	}
-	
+
 	static void unsetContext() {
 		resetContextEnvironment();
 	}

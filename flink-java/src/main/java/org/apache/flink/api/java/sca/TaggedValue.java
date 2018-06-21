@@ -19,8 +19,9 @@
 package org.apache.flink.api.java.sca;
 
 import org.apache.flink.annotation.Internal;
-import org.objectweb.asm.Type;
-import org.objectweb.asm.tree.analysis.BasicValue;
+
+import org.apache.flink.shaded.asm5.org.objectweb.asm.Type;
+import org.apache.flink.shaded.asm5.org.objectweb.asm.tree.analysis.BasicValue;
 
 import java.util.HashMap;
 import java.util.Iterator;
@@ -34,7 +35,10 @@ import java.util.Map.Entry;
 @Internal
 public class TaggedValue extends BasicValue {
 
-	public static enum Tag {
+	/**
+	 * Possible tags.
+	 */
+	public enum Tag {
 		REGULAR, // regular object with no special meaning
 		THIS, // a special container which is the instance of the UDF
 		INPUT, // atomic input field
@@ -44,9 +48,12 @@ public class TaggedValue extends BasicValue {
 		INPUT_1_ITERABLE, INPUT_2_ITERABLE, INPUT_1_ITERATOR, INPUT_2_ITERATOR, // input iterators
 		ITERATOR_TRUE_ASSUMPTION, // boolean value that is "true" at least once
 		NULL // null
-	};
+	}
 
-	public static enum Input {
+	/**
+	 * Distinguishes between inputs in case of two input operators.
+	 */
+	public enum Input {
 		INPUT_1(0), INPUT_2(1);
 
 		private int id;
@@ -58,7 +65,7 @@ public class TaggedValue extends BasicValue {
 		public int getId() {
 			return id;
 		}
-	};
+	}
 
 	private Tag tag;
 	// only inputs can set this to true
@@ -219,7 +226,7 @@ public class TaggedValue extends BasicValue {
 
 	private void traverseContainer(Input input, Map<String, TaggedValue> containerMapping, StringBuilder sb,
 			String prefix) {
-		for (Map.Entry<String,TaggedValue> entry : containerMapping.entrySet()) {
+		for (Map.Entry<String, TaggedValue> entry : containerMapping.entrySet()) {
 			// skip undefined states
 			if (entry.getValue() == null) {
 				continue;
@@ -244,7 +251,7 @@ public class TaggedValue extends BasicValue {
 			// input containers
 			else if (entry.getValue().canContainFields()) {
 				traverseContainer(input, entry.getValue().containerMapping, sb,
-						((prefix.length() > 0)? prefix + "." : "") + entry.getKey());
+						((prefix.length() > 0) ? prefix + "." : "") + entry.getKey());
 			}
 		}
 	}

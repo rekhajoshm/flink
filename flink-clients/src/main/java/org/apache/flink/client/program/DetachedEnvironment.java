@@ -24,6 +24,8 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobSubmissionResult;
 import org.apache.flink.api.common.Plan;
 import org.apache.flink.optimizer.plan.FlinkPlan;
+import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,18 +44,18 @@ public class DetachedEnvironment extends ContextEnvironment {
 	private static final Logger LOG = LoggerFactory.getLogger(DetachedEnvironment.class);
 
 	public DetachedEnvironment(
-			Client remoteConnection,
+			ClusterClient<?> remoteConnection,
 			List<URL> jarFiles,
 			List<URL> classpaths,
 			ClassLoader userCodeClassLoader,
-			String savepointPath) {
-		super(remoteConnection, jarFiles, classpaths, userCodeClassLoader, savepointPath);
+			SavepointRestoreSettings savepointSettings) {
+		super(remoteConnection, jarFiles, classpaths, userCodeClassLoader, savepointSettings);
 	}
 
 	@Override
 	public JobExecutionResult execute(String jobName) throws Exception {
 		Plan p = createProgramPlan(jobName);
-		setDetachedPlan(Client.getOptimizedPlan(client.compiler, p, getParallelism()));
+		setDetachedPlan(ClusterClient.getOptimizedPlan(client.compiler, p, getParallelism()));
 		LOG.warn("Job was executed in detached mode, the results will be available on completion.");
 		this.lastJobExecutionResult = DetachedJobExecutionResult.INSTANCE;
 		return this.lastJobExecutionResult;
@@ -72,9 +74,12 @@ public class DetachedEnvironment extends ContextEnvironment {
 	 * Finishes this Context Environment's execution by explicitly running the plan constructed.
 	 */
 	JobSubmissionResult finalizeExecute() throws ProgramInvocationException {
-		return client.runDetached(detachedPlan, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointPath);
+		return client.run(detachedPlan, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointSettings);
 	}
 
+	/**
+	 * The {@link JobExecutionResult} returned by a {@link DetachedEnvironment}.
+	 */
 	public static final class DetachedJobExecutionResult extends JobExecutionResult {
 
 		public static final DetachedJobExecutionResult INSTANCE = new DetachedJobExecutionResult();

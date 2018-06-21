@@ -25,26 +25,26 @@ import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.graph.Graph;
 import org.apache.flink.graph.GraphAlgorithm;
 import org.apache.flink.graph.Vertex;
+import org.apache.flink.graph.spargel.GatherFunction;
 import org.apache.flink.graph.spargel.MessageIterator;
-import org.apache.flink.graph.spargel.MessagingFunction;
-import org.apache.flink.graph.spargel.VertexUpdateFunction;
-import org.apache.flink.graph.utils.NullValueEdgeMapper;
+import org.apache.flink.graph.spargel.ScatterFunction;
+import org.apache.flink.graph.utils.GraphUtils.MapTo;
 import org.apache.flink.types.NullValue;
 
 /**
  * A scatter-gather implementation of the Weakly Connected Components algorithm.
  *
- * This implementation uses a comparable vertex value as initial component
+ * <p>This implementation uses a comparable vertex value as initial component
  * identifier (ID). Vertices propagate their current value in each iteration.
  * Upon receiving component IDs from its neighbors, a vertex adopts a new
  * component ID if its value is lower than its current component ID.
  *
- * The algorithm converges when vertices no longer update their component ID
+ * <p>The algorithm converges when vertices no longer update their component ID
  * value or when the maximum number of iterations has been reached.
- * 
- * The result is a DataSet of vertices, where the vertex value corresponds to
+ *
+ * <p>The result is a DataSet of vertices, where the vertex value corresponds to
  * the assigned component ID.
- * 
+ *
  * @see GSAConnectedComponents
  */
 @SuppressWarnings("serial")
@@ -58,7 +58,7 @@ public class ConnectedComponents<K, VV extends Comparable<VV>, EV>
 	 * The algorithm computes weakly connected components
 	 * and converges when no vertex updates its component ID
 	 * or when the maximum number of iterations has been reached.
-	 * 
+	 *
 	 * @param maxIterations The maximum number of iterations to run.
 	 */
 	public ConnectedComponents(Integer maxIterations) {
@@ -72,43 +72,20 @@ public class ConnectedComponents<K, VV extends Comparable<VV>, EV>
 		TypeInformation<VV> valueTypeInfo = ((TupleTypeInfo<?>) graph.getVertices().getType()).getTypeAt(1);
 
 		Graph<K, VV, NullValue> undirectedGraph = graph
-			.mapEdges(new NullValueEdgeMapper<K, EV>())
+			.mapEdges(new MapTo<>(NullValue.getInstance()))
 			.getUndirected();
 
 		return undirectedGraph.runScatterGatherIteration(
-			new CCUpdater<K, VV>(),
-			new CCMessenger<K, VV>(valueTypeInfo),
+			new CCMessenger<>(valueTypeInfo),
+			new CCUpdater<>(),
 			maxIterations).getVertices();
-	}
-
-	/**
-	 * Updates the value of a vertex by picking the minimum neighbor value out of all the incoming messages.
-	 */
-	public static final class CCUpdater<K, VV extends Comparable<VV>>
-		extends VertexUpdateFunction<K, VV, VV> {
-
-		@Override
-		public void updateVertex(Vertex<K, VV> vertex, MessageIterator<VV> messages) throws Exception {
-			VV current = vertex.getValue();
-			VV min = current;
-
-			for (VV msg : messages) {
-				if (msg.compareTo(min) < 0) {
-					min = msg;
-				}
-			}
-
-			if (!min.equals(current)) {
-				setNewVertexValue(min);
-			}
-		}
 	}
 
 	/**
 	 * Sends the current vertex value to all adjacent vertices.
 	 */
 	public static final class CCMessenger<K, VV extends Comparable<VV>>
-		extends MessagingFunction<K, VV, VV, NullValue>
+		extends ScatterFunction<K, VV, VV, NullValue>
 		implements ResultTypeQueryable<VV> {
 
 		private final TypeInformation<VV> typeInformation;
@@ -126,6 +103,29 @@ public class ConnectedComponents<K, VV extends Comparable<VV>, EV>
 		@Override
 		public TypeInformation<VV> getProducedType() {
 			return typeInformation;
+		}
+	}
+
+	/**
+	 * Updates the value of a vertex by picking the minimum neighbor value out of all the incoming messages.
+	 */
+	public static final class CCUpdater<K, VV extends Comparable<VV>>
+		extends GatherFunction<K, VV, VV> {
+
+		@Override
+		public void updateVertex(Vertex<K, VV> vertex, MessageIterator<VV> messages) throws Exception {
+			VV current = vertex.getValue();
+			VV min = current;
+
+			for (VV msg : messages) {
+				if (msg.compareTo(min) < 0) {
+					min = msg;
+				}
+			}
+
+			if (!min.equals(current)) {
+				setNewVertexValue(min);
+			}
 		}
 	}
 }

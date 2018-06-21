@@ -27,24 +27,72 @@ import copy
 import sys
 from struct import pack
 
+
+class EnvironmentContainer(object):
+    """Keeps track of which ExecutionEnvironment is active."""
+
+    _environment_counter = 0
+    _environment_id_to_execute = None
+    _plan_mode = None
+
+    def create_environment(self):
+        """Creates a new environment with a unique id."""
+        env = Environment(self, self._environment_counter)
+        self._environment_counter += 1
+        return env
+
+    def is_planning(self):
+        """
+        Checks whether we are generating the plan or executing an operator.
+
+        :return: True, if the plan is generated, false otherwise
+        """
+        if self._plan_mode is None:
+            mode = sys.stdin.readline().rstrip('\n')
+            if mode == "plan":
+                self._plan_mode = True
+            elif mode == "operator":
+                self._plan_mode = False
+            else:
+                raise ValueError("Invalid mode specified: " + mode)
+        return self._plan_mode
+
+    def should_execute(self, environment):
+        """
+        Checks whether the given ExecutionEnvironment should run the contained plan.
+
+        :param: ExecutionEnvironment to check
+        :return: True, if the environment should run the contained plan, false otherise
+        """
+        if self._environment_id_to_execute is None:
+            self._environment_id_to_execute = int(sys.stdin.readline().rstrip('\n'))
+
+        return environment._env_id == self._environment_id_to_execute
+
+
+container = EnvironmentContainer()
+
+
 def get_environment():
     """
     Creates an execution environment that represents the context in which the program is currently executed.
-    
+
     :return:The execution environment of the context in which the program is executed.
     """
-    return Environment()
+    return container.create_environment()
 
 
 class Environment(object):
-    def __init__(self):
+    def __init__(self, container, env_id):
         # util
         self._counter = 0
 
         #parameters
         self._dop = -1
-        self._local_mode = False
         self._retry = 0
+
+        self._container = container
+        self._env_id = env_id
 
         #sets
         self._sources = []
@@ -163,12 +211,9 @@ class Environment(object):
 
         The environment will execute all parts of the program that have resulted in a "sink" operation.
         """
-        self._local_mode = local
         self._optimize_plan()
 
-        plan_mode = sys.stdin.readline().rstrip('\n') == "plan"
-
-        if plan_mode:
+        if self._container.is_planning():
             port = int(sys.stdin.readline().rstrip('\n'))
             self._connection = Connection.PureTCPConnection(port)
             self._iterator = Iterator.PlanIterator(self._connection, self)
@@ -180,30 +225,35 @@ class Environment(object):
         else:
             import struct
             operator = None
+            port = None
             try:
-                port = int(sys.stdin.readline().rstrip('\n'))
+                if self._container.should_execute(self):
+                    id = int(sys.stdin.readline().rstrip('\n'))
 
-                id = int(sys.stdin.readline().rstrip('\n'))
-                input_path = sys.stdin.readline().rstrip('\n')
-                output_path = sys.stdin.readline().rstrip('\n')
+                    port = int(sys.stdin.readline().rstrip('\n'))
+                    subtask_index = int(sys.stdin.readline().rstrip('\n'))
+                    mmap_size = int(sys.stdin.readline().rstrip('\n'))
+                    input_path = sys.stdin.readline().rstrip('\n')
+                    output_path = sys.stdin.readline().rstrip('\n')
 
-                used_set = None
-                operator = None
-                for set in self._sets:
-                    if set.id == id:
-                        used_set = set
-                        operator = set.operator
-                operator._configure(input_path, output_path, port, self, used_set)
-                operator._go()
-                operator._close()
-                sys.stdout.flush()
-                sys.stderr.flush()
+                    used_set = None
+                    operator = None
+
+                    for set in self._sets:
+                        if set.id == id:
+                            used_set = set
+                            operator = set.operator
+                    operator._configure(input_path, output_path, mmap_size, port, self, used_set, subtask_index)
+                    operator._go()
+                    operator._close()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
             except:
                 sys.stdout.flush()
                 sys.stderr.flush()
-                if operator is not None:
+                if operator is not None and operator._connection is not None:
                     operator._connection._socket.send(struct.pack(">i", -2))
-                else:
+                elif port is not None:
                     socket = SOCKET.socket(family=SOCKET.AF_INET, type=SOCKET.SOCK_STREAM)
                     socket.connect((SOCKET.gethostbyname("localhost"), port))
                     socket.send(struct.pack(">i", -2))
@@ -218,15 +268,23 @@ class Environment(object):
         dual_input = set([_Identifier.JOIN, _Identifier.JOINH, _Identifier.JOINT, _Identifier.CROSS, _Identifier.CROSSH, _Identifier.CROSST, _Identifier.COGROUP, _Identifier.UNION])
         x = len(self._sets) - 1
         while x > -1:
+            # CHAIN(parent -> child) -> grand_child
+            # for all intents and purposes the child set ceases to exist; it is merged into the parent
             child = self._sets[x]
             child_type = child.identifier
             if child_type in chainable:
                 parent = child.parent
-                if parent.operator is not None and len(parent.children) == 1 and len(parent.sinks) == 0:
+                # we can only chain to an actual python udf (=> operator is not None)
+                # we may only chain if the parent has only 1 child
+                # we may only chain if the parent is not used as a broadcast variable
+                # we may only chain if the parent does not use the child as a broadcast variable
+                if parent.operator is not None and len(parent.children) == 1 and len(parent.sinks) == 0 and parent not in self._broadcast and child not in parent.bcvars:
                     parent.chained_info = child
                     parent.name += " -> " + child.name
                     parent.types = child.types
+                    # grand_children now belong to the parent
                     for grand_child in child.children:
+                        # dual_input operations have 2 parents; hence we have to change the correct one
                         if grand_child.identifier in dual_input:
                             if grand_child.parent.id == child.id:
                                 grand_child.parent = parent
@@ -234,19 +292,30 @@ class Environment(object):
                                 grand_child.other = parent
                         else:
                             grand_child.parent = parent
-                            parent.children.append(grand_child)
-                    parent.children.remove(child)
+                        parent.children.append(grand_child)
+                    # if child is used as a broadcast variable the parent must now be used instead
+                    for s in self._sets:
+                        if child in s.bcvars:
+                            s.bcvars.remove(child)
+                            s.bcvars.append(parent)
+                    for bcvar in self._broadcast:
+                        if bcvar.other.id == child.id:
+                            bcvar.other = parent
+                    # child sinks now belong to the parent
                     for sink in child.sinks:
                         sink.parent = parent
                         parent.sinks.append(sink)
+                    # child broadcast variables now belong to the parent
                     for bcvar in child.bcvars:
                         bcvar.parent = parent
                         parent.bcvars.append(bcvar)
-                    self._remove_set((child))
+                    # remove child set as it has been merged into the parent
+                    parent.children.remove(child)
+                    self._remove_set(child)
             x -= 1
 
     def _remove_set(self, set):
-        self._sets[:] = [s for s in self._sets if s.id!=set.id]
+        self._sets[:] = [s for s in self._sets if s.id != set.id]
 
     def _send_plan(self):
         self._send_parameters()
@@ -255,8 +324,8 @@ class Environment(object):
     def _send_parameters(self):
         collect = self._collector.collect
         collect(("dop", self._dop))
-        collect(("mode", self._local_mode))
         collect(("retry", self._retry))
+        collect(("id", self._env_id))
 
     def _send_operations(self):
         self._collector.collect(len(self._sources) + len(self._sets) + len(self._sinks) + len(self._broadcast))

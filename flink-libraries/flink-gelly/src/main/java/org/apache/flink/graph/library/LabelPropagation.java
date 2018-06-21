@@ -25,10 +25,10 @@ import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.graph.Graph;
 import org.apache.flink.graph.GraphAlgorithm;
 import org.apache.flink.graph.Vertex;
+import org.apache.flink.graph.spargel.GatherFunction;
 import org.apache.flink.graph.spargel.MessageIterator;
-import org.apache.flink.graph.spargel.MessagingFunction;
-import org.apache.flink.graph.spargel.VertexUpdateFunction;
-import org.apache.flink.graph.utils.NullValueEdgeMapper;
+import org.apache.flink.graph.spargel.ScatterFunction;
+import org.apache.flink.graph.utils.GraphUtils.MapTo;
 import org.apache.flink.types.NullValue;
 
 import java.util.HashMap;
@@ -40,7 +40,7 @@ import java.util.Map.Entry;
  * detects communities by propagating labels. In each iteration, a vertex adopts
  * the label that is most frequent among its neighbors' labels.
  *
- * The initial vertex values are used as initial labels and are expected to be
+ * <p>The initial vertex values are used as initial labels and are expected to be
  * {@link Comparable}. In case of a tie (i.e. two or more labels appear with the
  * same frequency), the algorithm picks the greater label. The algorithm converges
  * when no vertex changes its value or the maximum number of iterations has been
@@ -60,10 +60,10 @@ public class LabelPropagation<K, VV extends Comparable<VV>, EV>
 	 * Creates a new Label Propagation algorithm instance.
 	 * The algorithm converges when vertices no longer update their value
 	 * or when the maximum number of iterations is reached.
-	 * 
+	 *
 	 * @see <a href="http://journals.aps.org/pre/abstract/10.1103/PhysRevE.76.036106">
 	 * Near linear time algorithm to detect community structures in large-scale networks</a>
-	 * 
+	 *
 	 * @param maxIterations The maximum number of iterations to run.
 	 */
 	public LabelPropagation(int maxIterations) {
@@ -76,20 +76,43 @@ public class LabelPropagation<K, VV extends Comparable<VV>, EV>
 		TypeInformation<VV> valueType = ((TupleTypeInfo<?>) input.getVertices().getType()).getTypeAt(1);
 		// iteratively adopt the most frequent label among the neighbors of each vertex
 		return input
-			.mapEdges(new NullValueEdgeMapper<K, EV>())
+			.mapEdges(new MapTo<>(NullValue.getInstance()))
 			.runScatterGatherIteration(
-				new UpdateVertexLabel<K, VV>(), new SendNewLabelToNeighbors<K, VV>(valueType), maxIterations)
+				new SendNewLabelToNeighbors<>(valueType), new UpdateVertexLabel<>(), maxIterations)
 			.getVertices();
 	}
 
 	/**
-	 * Function that updates the value of a vertex by adopting the most frequent
-	 * label among its in-neighbors
+	 * Sends the vertex label to all out-neighbors.
 	 */
-	public static final class UpdateVertexLabel<K, VV extends Comparable<VV>> extends VertexUpdateFunction<K, VV, VV> {
+	public static final class SendNewLabelToNeighbors<K, VV extends Comparable<VV>>
+		extends ScatterFunction<K, VV, VV, NullValue>
+		implements ResultTypeQueryable<VV> {
+
+		private final TypeInformation<VV> typeInformation;
+
+		public SendNewLabelToNeighbors(TypeInformation<VV> typeInformation) {
+			this.typeInformation = typeInformation;
+		}
+
+		public void sendMessages(Vertex<K, VV> vertex) {
+			sendMessageToAllNeighbors(vertex.getValue());
+		}
+
+		@Override
+		public TypeInformation<VV> getProducedType() {
+			return typeInformation;
+		}
+	}
+
+	/**
+	 * Function that updates the value of a vertex by adopting the most frequent
+	 * label among its in-neighbors.
+	 */
+	public static final class UpdateVertexLabel<K, VV extends Comparable<VV>> extends GatherFunction<K, VV, VV> {
 
 		public void updateVertex(Vertex<K, VV> vertex, MessageIterator<VV> inMessages) {
-			Map<VV, Long> labelsWithFrequencies = new HashMap<VV, Long>();
+			Map<VV, Long> labelsWithFrequencies = new HashMap<>();
 
 			long maxFrequency = 1;
 			VV mostFrequentLabel = vertex.getValue();
@@ -117,29 +140,6 @@ public class LabelPropagation<K, VV extends Comparable<VV>, EV>
 				}
 			}
 			setNewVertexValue(mostFrequentLabel);
-		}
-	}
-
-	/**
-	 * Sends the vertex label to all out-neighbors
-	 */
-	public static final class SendNewLabelToNeighbors<K, VV extends Comparable<VV>>
-		extends MessagingFunction<K, VV, VV, NullValue>
-		implements ResultTypeQueryable<VV> {
-
-		private final TypeInformation<VV> typeInformation;
-
-		public SendNewLabelToNeighbors(TypeInformation<VV> typeInformation) {
-			this.typeInformation = typeInformation;
-		}
-
-		public void sendMessages(Vertex<K, VV> vertex) {
-			sendMessageToAllNeighbors(vertex.getValue());
-		}
-
-		@Override
-		public TypeInformation<VV> getProducedType() {
-			return typeInformation;
 		}
 	}
 }

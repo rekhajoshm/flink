@@ -90,10 +90,10 @@ public class CoLocationConstraintTest {
 			Instance instance1 = SchedulerTestUtils.getRandomInstance(2);
 			Instance instance2 = SchedulerTestUtils.getRandomInstance(2);
 			
-			SharedSlot slot1_1 = instance1.allocateSharedSlot(jid, assignment);
-			SharedSlot slot1_2 = instance1.allocateSharedSlot(jid, assignment);
-			SharedSlot slot2_1 = instance2.allocateSharedSlot(jid, assignment);
-			SharedSlot slot2_2 = instance2.allocateSharedSlot(jid, assignment);
+			SharedSlot slot1_1 = instance1.allocateSharedSlot(assignment);
+			SharedSlot slot1_2 = instance1.allocateSharedSlot(assignment);
+			SharedSlot slot2_1 = instance2.allocateSharedSlot(assignment);
+			SharedSlot slot2_2 = instance2.allocateSharedSlot(assignment);
 			
 			// constraint is still completely unassigned
 			assertFalse(constraint.isAssigned());
@@ -140,7 +140,7 @@ public class CoLocationConstraintTest {
 			// now, the location is assigned and we have a location
 			assertTrue(constraint.isAssigned());
 			assertTrue(constraint.isAssignedAndAlive());
-			assertEquals(instance2, constraint.getLocation());
+			assertEquals(instance2.getTaskManagerLocation(), constraint.getLocation());
 			
 			// release the slot
 			slot2_1.releaseSlot();
@@ -148,7 +148,7 @@ public class CoLocationConstraintTest {
 			// we should still have a location
 			assertTrue(constraint.isAssigned());
 			assertFalse(constraint.isAssignedAndAlive());
-			assertEquals(instance2, constraint.getLocation());
+			assertEquals(instance2.getTaskManagerLocation(), constraint.getLocation());
 
 			// we can not assign a different location
 			try {
@@ -167,7 +167,7 @@ public class CoLocationConstraintTest {
 
 			assertTrue(constraint.isAssigned());
 			assertTrue(constraint.isAssignedAndAlive());
-			assertEquals(instance2, constraint.getLocation());
+			assertEquals(instance2.getTaskManagerLocation(), constraint.getLocation());
 		}
 		catch (Exception e) {
 			e.printStackTrace();

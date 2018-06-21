@@ -23,10 +23,11 @@ import org.apache.flink.annotation.Internal
 import org.apache.flink.api.common.ExecutionConfig
 import org.apache.flink.api.common.typeinfo._
 import org.apache.flink.api.common.typeutils._
+import org.apache.flink.api.java.tuple.Tuple
 import org.apache.flink.api.java.typeutils._
+import org.apache.flink.api.java.typeutils.runtime.TupleSerializerBase
 import org.apache.flink.api.scala.typeutils._
 import org.apache.flink.types.Value
-import org.apache.hadoop.io.Writable
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -52,6 +53,9 @@ private[flink] trait TypeInformationGen[C <: Context] {
   // We have this for internal use so that we can use it to recursively generate a tree of
   // TypeInformation from a tree of UDTDescriptor
   def mkTypeInfo[T: c.WeakTypeTag](desc: UDTDescriptor): c.Expr[TypeInformation[T]] = desc match {
+
+    case f: FactoryTypeDescriptor => mkTypeInfoFromFactory(f)
+
     case cc@CaseClassDescriptor(_, tpe, _, _, _) =>
       mkCaseClassTypeInfo(cc)(c.WeakTypeTag(tpe).asInstanceOf[c.WeakTypeTag[Product]])
         .asInstanceOf[c.Expr[TypeInformation[T]]]
@@ -82,15 +86,30 @@ private[flink] trait TypeInformationGen[C <: Context] {
       mkValueTypeInfo(v)(c.WeakTypeTag(v.tpe).asInstanceOf[c.WeakTypeTag[Value]])
         .asInstanceOf[c.Expr[TypeInformation[T]]]
 
-    case d : WritableDescriptor =>
-      mkWritableTypeInfo(d)(c.WeakTypeTag(d.tpe).asInstanceOf[c.WeakTypeTag[Writable]])
-        .asInstanceOf[c.Expr[TypeInformation[T]]]
-
     case pojo: PojoDescriptor => mkPojo(pojo)
 
     case javaTuple: JavaTupleDescriptor => mkJavaTuple(javaTuple)
 
     case d => mkGenericTypeInfo(d)
+  }
+
+  def mkTypeInfoFromFactory[T: c.WeakTypeTag](desc: FactoryTypeDescriptor)
+    : c.Expr[TypeInformation[T]] = {
+
+    val tpeClazz = c.Expr[Class[T]](Literal(Constant(desc.tpe)))
+    val baseClazz = c.Expr[Class[T]](Literal(Constant(desc.baseType)))
+
+    val typeInfos = desc.params map { p => mkTypeInfo(p)(c.WeakTypeTag(p.tpe)).tree }
+    val typeInfosList = c.Expr[List[TypeInformation[_]]](mkList(typeInfos.toList))
+
+    reify {
+      val factory = TypeExtractor.getTypeInfoFactory[T](baseClazz.splice)
+      val genericParameters = typeInfosList.splice
+        .zip(baseClazz.splice.getTypeParameters).map { case (typeInfo, typeParam) =>
+          typeParam.getName -> typeInfo
+        }.toMap[String, TypeInformation[_]]
+      factory.createTypeInfo(tpeClazz.splice, genericParameters.asJava)
+    }
   }
 
   def mkCaseClassTypeInfo[T <: Product : c.WeakTypeTag](
@@ -129,6 +148,15 @@ private[flink] trait TypeInformationGen[C <: Context] {
           new CaseClassSerializer[T](getTypeClass(), fieldSerializers) {
             override def createInstance(fields: Array[AnyRef]): T = {
               instance.splice
+            }
+
+            override def createSerializerInstance(
+                tupleClass: Class[T],
+                fieldSerializers: Array[TypeSerializer[_]]) = {
+              this.getClass
+                .getConstructors()(0)
+                .newInstance(tupleClass, fieldSerializers)
+                .asInstanceOf[CaseClassSerializer[T]]
             }
           }
         }
@@ -284,14 +312,6 @@ private[flink] trait TypeInformationGen[C <: Context] {
     val tpeClazz = c.Expr[Class[T]](Literal(Constant(desc.tpe)))
     reify {
       new ValueTypeInfo[T](tpeClazz.splice)
-    }
-  }
-
-  def mkWritableTypeInfo[T <: Writable : c.WeakTypeTag](
-      desc: UDTDescriptor): c.Expr[TypeInformation[T]] = {
-    val tpeClazz = c.Expr[Class[T]](Literal(Constant(desc.tpe)))
-    reify {
-      new WritableTypeInfo[T](tpeClazz.splice)
     }
   }
 

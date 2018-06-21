@@ -18,93 +18,105 @@
 
 package org.apache.flink.yarn;
 
-import akka.actor.ActorRef;
-import akka.actor.ActorSystem;
-import akka.actor.Props;
-
-import org.apache.flink.client.CliFrontend;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.GlobalConfiguration;
+import org.apache.flink.configuration.HighAvailabilityOptions;
+import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.configuration.ResourceManagerOptions;
+import org.apache.flink.configuration.SecurityOptions;
+import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.runtime.akka.AkkaUtils;
 import org.apache.flink.runtime.clusterframework.BootstrapTools;
 import org.apache.flink.runtime.clusterframework.ContaineredTaskManagerParameters;
+import org.apache.flink.runtime.concurrent.ScheduledExecutorServiceAdapter;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
 import org.apache.flink.runtime.jobmanager.JobManager;
 import org.apache.flink.runtime.jobmanager.MemoryArchivist;
-import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
+import org.apache.flink.runtime.jobmaster.JobMaster;
+import org.apache.flink.runtime.metrics.MetricRegistryConfiguration;
+import org.apache.flink.runtime.metrics.MetricRegistryImpl;
 import org.apache.flink.runtime.process.ProcessReaper;
+import org.apache.flink.runtime.security.SecurityConfiguration;
+import org.apache.flink.runtime.security.SecurityUtils;
 import org.apache.flink.runtime.taskmanager.TaskManager;
 import org.apache.flink.runtime.util.EnvironmentInformation;
-import org.apache.flink.runtime.util.LeaderRetrievalUtils;
+import org.apache.flink.runtime.util.ExecutorThreadFactory;
+import org.apache.flink.runtime.util.Hardware;
+import org.apache.flink.runtime.util.JvmShutdownSafeguard;
 import org.apache.flink.runtime.util.SignalHandler;
 import org.apache.flink.runtime.webmonitor.WebMonitor;
+import org.apache.flink.runtime.webmonitor.retriever.impl.AkkaJobManagerRetriever;
+import org.apache.flink.runtime.webmonitor.retriever.impl.AkkaQueryServiceRetriever;
+import org.apache.flink.util.ExecutorUtils;
+import org.apache.flink.yarn.cli.FlinkYarnSessionCli;
+import org.apache.flink.yarn.configuration.YarnConfigOptions;
 
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.DataOutputBuffer;
-import org.apache.hadoop.security.Credentials;
+import akka.actor.ActorRef;
+import akka.actor.ActorSystem;
+import akka.actor.Props;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.security.token.Token;
-import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
-import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.util.Records;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import scala.Option;
+import scala.Some;
 import scala.concurrent.duration.FiniteDuration;
 
-import java.io.File;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.security.PrivilegedAction;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
+import static org.apache.flink.yarn.Utils.require;
 
 /**
  * This class is the executable entry point for the YARN application master.
- * It starts actor system and the actors for {@link org.apache.flink.runtime.jobmanager.JobManager}
+ * It starts actor system and the actors for {@link JobManager}
  * and {@link YarnFlinkResourceManager}.
- * 
- * The JobManager handles Flink job execution, while the YarnFlinkResourceManager handles container
+ *
+ * <p>The JobManager handles Flink job execution, while the YarnFlinkResourceManager handles container
  * allocation and failure detection.
  */
 public class YarnApplicationMasterRunner {
 
-	/** Logger */
 	protected static final Logger LOG = LoggerFactory.getLogger(YarnApplicationMasterRunner.class);
 
 	/** The maximum time that TaskManagers may be waiting to register at the JobManager,
-	 * before they quit */
+	 * before they quit. */
 	private static final FiniteDuration TASKMANAGER_REGISTRATION_TIMEOUT = new FiniteDuration(5, TimeUnit.MINUTES);
 
-	/** The process environment variables */
+	/** The process environment variables. */
 	private static final Map<String, String> ENV = System.getenv();
 
-	/** The exit code returned if the initialization of the application master failed */
+	/** The exit code returned if the initialization of the application master failed. */
 	private static final int INIT_ERROR_EXIT_CODE = 31;
 
-	/** The exit code returned if the process exits because a critical actor died */
+	/** The exit code returned if the process exits because a critical actor died. */
 	private static final int ACTOR_DIED_EXIT_CODE = 32;
-
 
 	// ------------------------------------------------------------------------
 	//  Program entry point
 	// ------------------------------------------------------------------------
 
 	/**
-	 * The entry point for the YARN application master. 
+	 * The entry point for the YARN application master.
 	 *
 	 * @param args The command line arguments.
 	 */
 	public static void main(String[] args) {
-		EnvironmentInformation.logEnvironmentInfo(LOG, "YARN ApplicationMaster / JobManager", args);
+		EnvironmentInformation.logEnvironmentInfo(LOG, "YARN ApplicationMaster / ResourceManager / JobManager", args);
 		SignalHandler.register(LOG);
+		JvmShutdownSafeguard.installAsShutdownHook(LOG);
 
 		// run and exit with the proper return code
 		int returnCode = new YarnApplicationMasterRunner().run(args);
@@ -113,7 +125,7 @@ public class YarnApplicationMasterRunner {
 
 	/**
 	 * The instance entry point for the YARN application master. Obtains user group
-	 * information and calls the main work method {@link #runApplicationMaster()} as a
+	 * information and calls the main work method {@link #runApplicationMaster(Configuration)} as a
 	 * privileged action.
 	 *
 	 * @param args The command line arguments.
@@ -123,34 +135,50 @@ public class YarnApplicationMasterRunner {
 		try {
 			LOG.debug("All environment variables: {}", ENV);
 
-			final String yarnClientUsername = ENV.get(YarnConfigKeys.ENV_CLIENT_USERNAME);
-			require(yarnClientUsername != null, "YARN client user name environment variable {} not set",
-				YarnConfigKeys.ENV_CLIENT_USERNAME);
+			final String yarnClientUsername = ENV.get(YarnConfigKeys.ENV_HADOOP_USER_NAME);
+			require(yarnClientUsername != null, "YARN client user name environment variable (%s) not set",
+				YarnConfigKeys.ENV_HADOOP_USER_NAME);
 
-			final UserGroupInformation currentUser;
-			try {
-				currentUser = UserGroupInformation.getCurrentUser();
-			} catch (Throwable t) {
-				throw new Exception("Cannot access UserGroupInformation information for current user", t);
+			final String currDir = ENV.get(Environment.PWD.key());
+			require(currDir != null, "Current working directory variable (%s) not set", Environment.PWD.key());
+			LOG.debug("Current working Directory: {}", currDir);
+
+			final String remoteKeytabPrincipal = ENV.get(YarnConfigKeys.KEYTAB_PRINCIPAL);
+			LOG.info("remoteKeytabPrincipal obtained {}", remoteKeytabPrincipal);
+
+			UserGroupInformation currentUser = UserGroupInformation.getCurrentUser();
+
+			LOG.info("YARN daemon is running as: {} Yarn client user obtainer: {}",
+					currentUser.getShortUserName(), yarnClientUsername);
+
+			// Flink configuration
+			final Map<String, String> dynamicProperties =
+				FlinkYarnSessionCli.getDynamicProperties(ENV.get(YarnConfigKeys.ENV_DYNAMIC_PROPERTIES));
+			LOG.debug("YARN dynamic properties: {}", dynamicProperties);
+
+			final Configuration flinkConfig = createConfiguration(currDir, dynamicProperties, LOG);
+
+			File f = new File(currDir, Utils.KEYTAB_FILE_NAME);
+			if (remoteKeytabPrincipal != null && f.exists()) {
+				String keytabPath = f.getAbsolutePath();
+				LOG.debug("keytabPath: {}", keytabPath);
+
+				// set keytab principal and replace path with the local path of the shipped keytab file in NodeManager
+				flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB, f.getAbsolutePath());
+				flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL, remoteKeytabPrincipal);
 			}
 
-			LOG.info("YARN daemon runs as user {}. Running Flink Application Master/JobManager as user {}",
-				currentUser.getShortUserName(), yarnClientUsername);
+			SecurityConfiguration sc = new SecurityConfiguration(flinkConfig);
 
-			UserGroupInformation ugi = UserGroupInformation.createRemoteUser(yarnClientUsername);
+			SecurityUtils.install(sc);
 
-			// transfer all security tokens, for example for authenticated HDFS and HBase access
-			for (Token<?> token : currentUser.getTokens()) {
-				ugi.addToken(token);
-			}
-
-			// run the actual work in a secured privileged action
-			return ugi.doAs(new PrivilegedAction<Integer>() {
+			return SecurityUtils.getInstalledContext().runSecured(new Callable<Integer>() {
 				@Override
-				public Integer run() {
-					return runApplicationMaster();
+				public Integer call() {
+					return runApplicationMaster(flinkConfig);
 				}
 			});
+
 		}
 		catch (Throwable t) {
 			// make sure that everything whatever ends up in the log
@@ -165,12 +193,24 @@ public class YarnApplicationMasterRunner {
 
 	/**
 	 * The main work method, must run as a privileged action.
-	 * 
-	 * @return The return code for the Java process. 
+	 *
+	 * @return The return code for the Java process.
 	 */
-	protected int runApplicationMaster() {
+	protected int runApplicationMaster(Configuration config) {
 		ActorSystem actorSystem = null;
 		WebMonitor webMonitor = null;
+		HighAvailabilityServices highAvailabilityServices = null;
+		MetricRegistryImpl metricRegistry = null;
+
+		int numberProcessors = Hardware.getNumberCPUCores();
+
+		final ScheduledExecutorService futureExecutor = Executors.newScheduledThreadPool(
+			numberProcessors,
+			new ExecutorThreadFactory("yarn-jobmanager-future"));
+
+		final ExecutorService ioExecutor = Executors.newFixedThreadPool(
+			numberProcessors,
+			new ExecutorThreadFactory("yarn-jobmanager-io"));
 
 		try {
 			// ------- (1) load and parse / validate all configurations -------
@@ -190,12 +230,16 @@ public class YarnApplicationMasterRunner {
 
 			LOG.info("YARN assigned hostname for application master: {}", appMasterHostname);
 
-			// Flink configuration
-			final Map<String, String> dynamicProperties =
-				CliFrontend.getDynamicProperties(ENV.get(YarnConfigKeys.ENV_DYNAMIC_PROPERTIES));
-			LOG.debug("YARN dynamic properties: {}", dynamicProperties);
+			final String remoteKeytabPrincipal = ENV.get(YarnConfigKeys.KEYTAB_PRINCIPAL);
 
-			final Configuration config = createConfiguration(currDir, dynamicProperties);
+			File f = new File(currDir, Utils.KEYTAB_FILE_NAME);
+			if (remoteKeytabPrincipal != null && f.exists()) {
+				String keytabPath = f.getAbsolutePath();
+				LOG.debug("keytabPath: {}", keytabPath);
+
+				config.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB, keytabPath);
+				config.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL, remoteKeytabPrincipal);
+			}
 
 			// Hadoop/Yarn configuration (loads config data automatically from classpath files)
 			final YarnConfiguration yarnConfig = new YarnConfiguration();
@@ -233,14 +277,12 @@ public class YarnApplicationMasterRunner {
 				taskManagerParameters.taskManagerHeapSizeMB(),
 				taskManagerParameters.taskManagerDirectMemoryLimitMB());
 
-
 			// ----------------- (2) start the actor system -------------------
 
 			// try to start the actor system, JobManager and JobManager actor system
 			// using the port range definition from the config.
 			final String amPortRange = config.getString(
-					ConfigConstants.YARN_APPLICATION_MASTER_PORT,
-					ConfigConstants.DEFAULT_YARN_JOB_MANAGER_PORT);
+					YarnConfigOptions.APPLICATION_MASTER_PORT);
 
 			actorSystem = BootstrapTools.startActorSystem(config, appMasterHostname, amPortRange, LOG);
 
@@ -249,18 +291,16 @@ public class YarnApplicationMasterRunner {
 
 			LOG.info("Actor system bound to hostname {}.", akkaHostname);
 
-
 			// ---- (3) Generate the configuration for the TaskManagers
 
 			final Configuration taskManagerConfig = BootstrapTools.generateTaskManagerConfiguration(
 					config, akkaHostname, akkaPort, slotsPerTaskManager, TASKMANAGER_REGISTRATION_TIMEOUT);
 			LOG.debug("TaskManager configuration: {}", taskManagerConfig);
 
-			final ContainerLaunchContext taskManagerContext = createTaskManagerContext(
+			final ContainerLaunchContext taskManagerContext = Utils.createTaskExecutorContext(
 				config, yarnConfig, ENV,
 				taskManagerParameters, taskManagerConfig,
 				currDir, getTaskManagerClass(), LOG);
-
 
 			// ---- (4) start the actors and components in this order:
 
@@ -269,48 +309,71 @@ public class YarnApplicationMasterRunner {
 			// 3) Resource Master for YARN
 			// 4) Process reapers for the JobManager and Resource Master
 
+			// 0: Start the JobManager services
 
-			// 1: the JobManager
+			// update the configuration used to create the high availability services
+			config.setString(JobManagerOptions.ADDRESS, akkaHostname);
+			config.setInteger(JobManagerOptions.PORT, akkaPort);
+
+			highAvailabilityServices = HighAvailabilityServicesUtils.createHighAvailabilityServices(
+				config,
+				ioExecutor,
+				HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION);
+
+			// 1: the web monitor
+			LOG.debug("Starting Web Frontend");
+
+			Time webMonitorTimeout = Time.milliseconds(config.getLong(WebOptions.TIMEOUT));
+
+			webMonitor = BootstrapTools.startWebMonitorIfConfigured(
+				config,
+				highAvailabilityServices,
+				new AkkaJobManagerRetriever(actorSystem, webMonitorTimeout, 10, Time.milliseconds(50L)),
+				new AkkaQueryServiceRetriever(actorSystem, webMonitorTimeout),
+				webMonitorTimeout,
+				new ScheduledExecutorServiceAdapter(futureExecutor),
+				LOG);
+
+			metricRegistry = new MetricRegistryImpl(
+				MetricRegistryConfiguration.fromConfiguration(config));
+
+			metricRegistry.startQueryService(actorSystem, null);
+
+			// 2: the JobManager
 			LOG.debug("Starting JobManager actor");
 
 			// we start the JobManager with its standard name
 			ActorRef jobManager = JobManager.startJobManagerActors(
-				config, actorSystem,
-				new scala.Some<>(JobManager.JOB_MANAGER_NAME()),
-				scala.Option.<String>empty(),
+				config,
+				actorSystem,
+				futureExecutor,
+				ioExecutor,
+				highAvailabilityServices,
+				metricRegistry,
+				webMonitor == null ? Option.empty() : Option.apply(webMonitor.getRestAddress()),
+				new Some<>(JobMaster.JOB_MANAGER_NAME),
+				Option.<String>empty(),
 				getJobManagerClass(),
 				getArchivistClass())._1();
 
-
-			// 2: the web monitor
-			LOG.debug("Starting Web Frontend");
-
-			webMonitor = BootstrapTools.startWebMonitorIfConfigured(config, actorSystem, jobManager, LOG);
-			final String webMonitorURL = webMonitor == null ? null :
-				"http://" + appMasterHostname + ":" + webMonitor.getServerPort();
+			final String webMonitorURL = webMonitor == null ? null : webMonitor.getRestAddress();
 
 			// 3: Flink's Yarn ResourceManager
 			LOG.debug("Starting YARN Flink Resource Manager");
-
-			// we need the leader retrieval service here to be informed of new
-			// leader session IDs, even though there can be only one leader ever
-			LeaderRetrievalService leaderRetriever = 
-				LeaderRetrievalUtils.createLeaderRetrievalService(config, jobManager);
 
 			Props resourceMasterProps = YarnFlinkResourceManager.createActorProps(
 				getResourceManagerClass(),
 				config,
 				yarnConfig,
-				leaderRetriever,
+				highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
 				appMasterHostname,
 				webMonitorURL,
 				taskManagerParameters,
 				taskManagerContext,
-				numInitialTaskManagers, 
+				numInitialTaskManagers,
 				LOG);
 
 			ActorRef resourceMaster = actorSystem.actorOf(resourceMasterProps);
-
 
 			// 4: Process reapers
 			// The process reapers ensure that upon unexpected actor death, the process exits
@@ -330,6 +393,14 @@ public class YarnApplicationMasterRunner {
 			// make sure that everything whatever ends up in the log
 			LOG.error("YARN Application Master initialization failed", t);
 
+			if (webMonitor != null) {
+				try {
+					webMonitor.stop();
+				} catch (Throwable ignored) {
+					LOG.warn("Failed to stop the web frontend", t);
+				}
+			}
+
 			if (actorSystem != null) {
 				try {
 					actorSystem.shutdown();
@@ -338,13 +409,8 @@ public class YarnApplicationMasterRunner {
 				}
 			}
 
-			if (webMonitor != null) {
-				try {
-					webMonitor.stop();
-				} catch (Throwable ignored) {
-					LOG.warn("Failed to stop the web frontend", t);
-				}
-			}
+			futureExecutor.shutdownNow();
+			ioExecutor.shutdownNow();
 
 			return INIT_ERROR_EXIT_CODE;
 		}
@@ -363,9 +429,31 @@ public class YarnApplicationMasterRunner {
 				LOG.error("Failed to stop the web frontend", t);
 			}
 		}
+
+		if (highAvailabilityServices != null) {
+			try {
+				highAvailabilityServices.close();
+			} catch (Throwable t) {
+				LOG.error("Failed to stop the high availability services.", t);
+			}
+		}
+
+		if (metricRegistry != null) {
+			try {
+				metricRegistry.shutdown().get();
+			} catch (Throwable t) {
+				LOG.error("Could not properly shut down the metric registry.", t);
+			}
+		}
+
+		ExecutorUtils.gracefulShutdown(
+			AkkaUtils.getTimeout(config).toMillis(),
+			TimeUnit.MILLISECONDS,
+			futureExecutor,
+			ioExecutor);
+
 		return 0;
 	}
-
 
 	// ------------------------------------------------------------------------
 	//  For testing, this allows to override the actor classes used for
@@ -393,213 +481,59 @@ public class YarnApplicationMasterRunner {
 	// ------------------------------------------------------------------------
 
 	/**
-	 * Validates a condition, throwing a RuntimeException if the condition is violated.
-	 * 
-	 * @param condition The condition.
-	 * @param message The message for the runtime exception, with format variables as defined by
-	 *                {@link String#format(String, Object...)}.
-	 * @param values The format arguments.
-	 */
-	private static void require(boolean condition, String message, Object... values) {
-		if (!condition) {
-			throw new RuntimeException(String.format(message, values));
-		}
-	}
-
-	/**
-	 * 
-	 * @param baseDirectory
-	 * @param additional
-	 * 
+	 * Reads the global configuration from the given directory and adds the given parameters to it.
+	 *
+	 * @param baseDirectory directory to load the configuration from
+	 * @param additional additional parameters to be included in the configuration
+	 * @param log logger instance
+	 *
 	 * @return The configuration to be used by the TaskManagers.
 	 */
 	@SuppressWarnings("deprecation")
-	private static Configuration createConfiguration(String baseDirectory, Map<String, String> additional) {
+	private static Configuration createConfiguration(String baseDirectory, Map<String, String> additional, Logger log) {
 		LOG.info("Loading config from directory " + baseDirectory);
 
-		GlobalConfiguration.loadConfiguration(baseDirectory);
-		Configuration configuration = GlobalConfiguration.getConfiguration();
-
-		configuration.setString(ConfigConstants.FLINK_BASE_DIR_PATH_KEY, baseDirectory);
+		Configuration configuration = GlobalConfiguration.loadConfiguration(baseDirectory);
 
 		// add dynamic properties to JobManager configuration.
 		for (Map.Entry<String, String> property : additional.entrySet()) {
 			configuration.setString(property.getKey(), property.getValue());
 		}
 
-		// if a web monitor shall be started, set the port to random binding
-		if (configuration.getInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, 0) >= 0) {
-			configuration.setInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, 0);
+		// override zookeeper namespace with user cli argument (if provided)
+		String cliZKNamespace = ENV.get(YarnConfigKeys.ENV_ZOOKEEPER_NAMESPACE);
+		if (cliZKNamespace != null && !cliZKNamespace.isEmpty()) {
+			configuration.setString(HighAvailabilityOptions.HA_CLUSTER_ID, cliZKNamespace);
 		}
 
-		// if the user has set the deprecated YARN-specific config keys, we add the 
+		// if a web monitor shall be started, set the port to random binding
+		if (configuration.getInteger(WebOptions.PORT, 0) >= 0) {
+			configuration.setInteger(WebOptions.PORT, 0);
+		}
+
+		// if the user has set the deprecated YARN-specific config keys, we add the
 		// corresponding generic config keys instead. that way, later code needs not
 		// deal with deprecated config keys
 
-		BootstrapTools.substituteDeprecatedConfigKey(configuration,
-			ConfigConstants.YARN_HEAP_CUTOFF_RATIO,
-			ConfigConstants.CONTAINERED_HEAP_CUTOFF_RATIO);
-
-		BootstrapTools.substituteDeprecatedConfigKey(configuration,
-			ConfigConstants.YARN_HEAP_CUTOFF_MIN,
-			ConfigConstants.CONTAINERED_HEAP_CUTOFF_MIN);
-
 		BootstrapTools.substituteDeprecatedConfigPrefix(configuration,
 			ConfigConstants.YARN_APPLICATION_MASTER_ENV_PREFIX,
-			ConfigConstants.CONTAINERED_MASTER_ENV_PREFIX);
+			ResourceManagerOptions.CONTAINERIZED_MASTER_ENV_PREFIX);
 
 		BootstrapTools.substituteDeprecatedConfigPrefix(configuration,
 			ConfigConstants.YARN_TASK_MANAGER_ENV_PREFIX,
-			ConfigConstants.CONTAINERED_TASK_MANAGER_ENV_PREFIX);
+			ResourceManagerOptions.CONTAINERIZED_TASK_MANAGER_ENV_PREFIX);
+
+		// configure local directory
+		if (configuration.contains(CoreOptions.TMP_DIRS)) {
+			log.info("Overriding YARN's temporary file directories with those " +
+				"specified in the Flink config: " + configuration.getValue(CoreOptions.TMP_DIRS));
+		}
+		else {
+			final String localDirs = ENV.get(Environment.LOCAL_DIRS.key());
+			log.info("Setting directories for temporary files to: {}", localDirs);
+			configuration.setString(CoreOptions.TMP_DIRS, localDirs);
+		}
 
 		return configuration;
-	}
-
-	/**
-	 * Creates the launch context, which describes how to bring up a TaskManager process in
-	 * an allocated YARN container.
-	 * 
-	 * <p>This code is extremely YARN specific and registers all the resources that the TaskManager
-	 * needs (such as JAR file, config file, ...) and all environment variables in a YARN
-	 * container launch context. The launch context then ensures that those resources will be
-	 * copied into the containers transient working directory. 
-	 * 
-	 * <p>We do this work before we start the ResourceManager actor in order to fail early if
-	 * any of the operations here fail.
-	 * 
-	 * @param flinkConfig
-	 *         The Flink configuration object.
-	 * @param yarnConfig
-	 *         The YARN configuration object.
-	 * @param env
-	 *         The environment variables.
-	 * @param tmParams
-	 *         The TaskManager container memory parameters. 
-	 * @param taskManagerConfig
-	 *         The configuration for the TaskManagers.
-	 * @param workingDirectory
-	 *         The current application master container's working directory. 
-	 * @param taskManagerMainClass
-	 *         The class with the main method.
-	 * @param log
-	 *         The logger.
-	 * 
-	 * @return The launch context for the TaskManager processes.
-	 * 
-	 * @throws Exception Thrown if teh launch context could not be created, for example if
-	 *                   the resources could not be copied.
-	 */
-	public static ContainerLaunchContext createTaskManagerContext(
-			Configuration flinkConfig,
-			YarnConfiguration yarnConfig,
-			Map<String, String> env,
-			ContaineredTaskManagerParameters tmParams,
-			Configuration taskManagerConfig,
-			String workingDirectory,
-			Class<?> taskManagerMainClass,
-			Logger log) throws Exception {
-
-		log.info("Setting up resources for TaskManagers");
-
-		// get and validate all relevant variables
-
-		String remoteFlinkJarPath = env.get(YarnConfigKeys.FLINK_JAR_PATH);
-		require(remoteFlinkJarPath != null, "Environment variable %s not set", YarnConfigKeys.FLINK_JAR_PATH);
-
-		String appId = env.get(YarnConfigKeys.ENV_APP_ID);
-		require(appId != null, "Environment variable %s not set", YarnConfigKeys.ENV_APP_ID);
-
-		String clientHomeDir = env.get(YarnConfigKeys.ENV_CLIENT_HOME_DIR);
-		require(clientHomeDir != null, "Environment variable %s not set", YarnConfigKeys.ENV_CLIENT_HOME_DIR);
-
-		String shipListString = env.get(YarnConfigKeys.ENV_CLIENT_SHIP_FILES);
-		require(shipListString != null, "Environment variable %s not set", YarnConfigKeys.ENV_CLIENT_SHIP_FILES);
-
-		String yarnClientUsername = env.get(YarnConfigKeys.ENV_CLIENT_USERNAME);
-		require(yarnClientUsername != null, "Environment variable %s not set", YarnConfigKeys.ENV_CLIENT_USERNAME);
-
-		// obtain a handle to the file system used by YARN
-		final org.apache.hadoop.fs.FileSystem yarnFileSystem;
-		try {
-			yarnFileSystem = org.apache.hadoop.fs.FileSystem.get(yarnConfig);
-		} catch (IOException e) {
-			throw new Exception("Could not access YARN's default file system", e);
-		}
-
-		// register Flink Jar with remote HDFS
-		LocalResource flinkJar = Records.newRecord(LocalResource.class);
-		{
-			Path remoteJarPath = new Path(remoteFlinkJarPath);
-			Utils.registerLocalResource(yarnFileSystem, remoteJarPath, flinkJar);
-		}
-
-		// register conf with local fs
-		LocalResource flinkConf = Records.newRecord(LocalResource.class);
-		{
-			// write the TaskManager configuration to a local file
-			final File taskManagerConfigFile = 
-				new File(workingDirectory, UUID.randomUUID() + "-taskmanager-conf.yaml");
-			LOG.debug("Writing TaskManager configuration to {}", taskManagerConfigFile.getAbsolutePath());
-			BootstrapTools.writeConfiguration(taskManagerConfig, taskManagerConfigFile);
-
-			Utils.setupLocalResource(yarnFileSystem, appId, 
-				new Path(taskManagerConfigFile.toURI()), flinkConf, new Path(clientHomeDir));
-
-			log.info("Prepared local resource for modified yaml: {}", flinkConf);
-		}
-
-		Map<String, LocalResource> taskManagerLocalResources = new HashMap<>();
-		taskManagerLocalResources.put("flink.jar", flinkJar);
-		taskManagerLocalResources.put("flink-conf.yaml", flinkConf);
-
-		// prepare additional files to be shipped
-		for (String pathStr : shipListString.split(",")) {
-			if (!pathStr.isEmpty()) {
-				LocalResource resource = Records.newRecord(LocalResource.class);
-				Path path = new Path(pathStr);
-				Utils.registerLocalResource(yarnFileSystem, path, resource);
-				taskManagerLocalResources.put(path.getName(), resource);
-			}
-		}
-
-		// now that all resources are prepared, we can create the launch context
-
-		log.info("Creating container launch context for TaskManagers");
-
-		boolean hasLogback = new File(workingDirectory, "logback.xml").exists();
-		boolean hasLog4j = new File(workingDirectory, "log4j.properties").exists();
-
-		String launchCommand = BootstrapTools.getTaskManagerShellCommand(
-			flinkConfig, tmParams, ".", ApplicationConstants.LOG_DIR_EXPANSION_VAR,
-			hasLogback, hasLog4j, taskManagerMainClass);
-
-		log.info("Starting TaskManagers with command: " + launchCommand);
-
-		ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
-		ctx.setCommands(Collections.singletonList(launchCommand));
-		ctx.setLocalResources(taskManagerLocalResources);
-
-		Map<String, String> containerEnv = new HashMap<>();
-		containerEnv.putAll(tmParams.taskManagerEnv());
-
-		// add YARN classpath, etc to the container environment
-		Utils.setupEnv(yarnConfig, containerEnv);
-		containerEnv.put(YarnConfigKeys.ENV_CLIENT_USERNAME, yarnClientUsername);
-
-		ctx.setEnvironment(containerEnv);
-
-		try {
-			UserGroupInformation user = UserGroupInformation.getCurrentUser();
-			Credentials credentials = user.getCredentials();
-			DataOutputBuffer dob = new DataOutputBuffer();
-			credentials.writeTokenStorageToStream(dob);
-			ByteBuffer securityTokens = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
-			ctx.setTokens(securityTokens);
-		}
-		catch (Throwable t) {
-			log.error("Getting current user info failed when trying to launch the container", t);
-		}
-
-		return ctx;
 	}
 }

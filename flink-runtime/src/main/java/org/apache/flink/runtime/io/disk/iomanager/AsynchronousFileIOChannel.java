@@ -28,7 +28,7 @@ import java.nio.channels.FileChannel;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * A base class for readers and writers that accept read or write requests for whole blocks.
@@ -367,14 +367,16 @@ final class BufferWriteRequest implements WriteRequest {
 
 	@Override
 	public void write() throws IOException {
+		ByteBuffer nioBufferReadable = buffer.getNioBufferReadable();
+
 		final ByteBuffer header = ByteBuffer.allocateDirect(8);
 
 		header.putInt(buffer.isBuffer() ? 1 : 0);
-		header.putInt(buffer.getSize());
+		header.putInt(nioBufferReadable.remaining());
 		header.flip();
 
 		channel.fileChannel.write(header);
-		channel.fileChannel.write(buffer.getNioBuffer());
+		channel.fileChannel.write(nioBufferReadable);
 	}
 
 	@Override
@@ -403,27 +405,8 @@ final class BufferReadRequest implements ReadRequest {
 		final FileChannel fileChannel = channel.fileChannel;
 
 		if (fileChannel.size() - fileChannel.position() > 0) {
-			final ByteBuffer header = ByteBuffer.allocateDirect(8);
-
-			fileChannel.read(header);
-			header.flip();
-
-			final boolean isBuffer = header.getInt() == 1;
-			final int size = header.getInt();
-
-			if (size > buffer.getMemorySegment().size()) {
-				throw new IllegalStateException("Buffer is too small for data: " + buffer.getMemorySegment().size() + " bytes available, but " + size + " needed. This is most likely due to an serialized event, which is larger than the buffer size.");
-			}
-
-			buffer.setSize(size);
-
-			fileChannel.read(buffer.getNioBuffer());
-
-			if (!isBuffer) {
-				buffer.tagAsEvent();
-			}
-
-			hasReachedEndOfFile.set(fileChannel.size() - fileChannel.position() == 0);
+			BufferFileChannelReader reader = new BufferFileChannelReader(fileChannel);
+			hasReachedEndOfFile.set(reader.readBufferFromFileChannel(buffer));
 		}
 		else {
 			hasReachedEndOfFile.set(true);

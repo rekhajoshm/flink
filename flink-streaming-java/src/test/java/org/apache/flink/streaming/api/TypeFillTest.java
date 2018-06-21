@@ -17,10 +17,6 @@
 
 package org.apache.flink.streaming.api;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
-
-
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
@@ -31,12 +27,18 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.co.CoFlatMapFunction;
 import org.apache.flink.streaming.api.functions.co.CoMapFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
-import org.apache.flink.streaming.util.StreamingMultipleProgramsTestBase;
 import org.apache.flink.util.Collector;
+
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
+
+/**
+ * Tests for {@link TypeFill}.
+ */
 @SuppressWarnings("serial")
-public class TypeFillTest extends StreamingMultipleProgramsTestBase {
+public class TypeFillTest {
 
 	@Test
 	public void test() {
@@ -46,7 +48,6 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 			env.addSource(new TestSource<Integer>()).print();
 			fail();
 		} catch (Exception ignored) {}
-		
 
 		DataStream<Long> source = env.generateSequence(1, 10);
 
@@ -54,17 +55,17 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 			source.map(new TestMap<Long, Long>()).print();
 			fail();
 		} catch (Exception ignored) {}
-		
+
 		try {
 			source.flatMap(new TestFlatMap<Long, Long>()).print();
 			fail();
 		} catch (Exception ignored) {}
-		
+
 		try {
 			source.connect(source).map(new TestCoMap<Long, Long, Integer>()).print();
 			fail();
 		} catch (Exception ignored) {}
-		
+
 		try {
 			source.connect(source).flatMap(new TestCoFlatMap<Long, Long, Integer>()).print();
 			fail();
@@ -76,7 +77,7 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 		source.connect(source).map(new TestCoMap<Long, Long, Integer>()).returns(BasicTypeInfo.INT_TYPE_INFO).print();
 		source.connect(source).flatMap(new TestCoFlatMap<Long, Long, Integer>())
 				.returns(BasicTypeInfo.INT_TYPE_INFO).print();
-		
+
 		assertEquals(BasicTypeInfo.LONG_TYPE_INFO,
 				source.map(new TestMap<Long, Long>()).returns(Long.class).getType());
 
@@ -96,7 +97,7 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 
 	}
 
-	private class TestSource<T> implements SourceFunction<T> {
+	private static class TestSource<T> implements SourceFunction<T> {
 		private static final long serialVersionUID = 1L;
 
 		@Override
@@ -106,19 +107,19 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 		public void cancel() {}
 	}
 
-	private class TestMap<T, O> implements MapFunction<T, O> {
+	private static class TestMap<T, O> implements MapFunction<T, O> {
 		@Override
 		public O map(T value) throws Exception {
 			return null;
 		}
 	}
 
-	private class TestFlatMap<T, O> implements FlatMapFunction<T, O> {
+	private static class TestFlatMap<T, O> implements FlatMapFunction<T, O> {
 		@Override
 		public void flatMap(T value, Collector<O> out) throws Exception {}
 	}
 
-	private class TestCoMap<IN1, IN2, OUT> implements CoMapFunction<IN1, IN2, OUT> {
+	private static class TestCoMap<IN1, IN2, OUT> implements CoMapFunction<IN1, IN2, OUT> {
 
 		@Override
 		public OUT map1(IN1 value) {
@@ -132,7 +133,7 @@ public class TypeFillTest extends StreamingMultipleProgramsTestBase {
 
 	}
 
-	private class TestCoFlatMap<IN1, IN2, OUT> implements CoFlatMapFunction<IN1, IN2, OUT> {
+	private static class TestCoFlatMap<IN1, IN2, OUT> implements CoFlatMapFunction<IN1, IN2, OUT> {
 
 		@Override
 		public void flatMap1(IN1 value, Collector<OUT> out) throws Exception {}

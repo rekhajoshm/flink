@@ -1,56 +1,118 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # s3 deployment based on http://about.travis-ci.org/blog/2012-12-18-travis-artifacts/
 
-# send to container based infrastructure: http://docs.travis-ci.com/user/workers/container-based-infrastructure/
-sudo: false
+# send to fully-virtualized infrastructure: https://docs.travis-ci.com/user/trusty-ci-environment/
+sudo: required
+dist: trusty
 
 cache:
   directories:
   - $HOME/.m2
 
+# do not cache our own artifacts
+before_cache:
+  - rm -rf $HOME/.m2/repository/org/apache/flink/
+
 install: true
 
 language: java
 
-#See https://issues.apache.org/jira/browse/FLINK-1072
-# NOTE: When changing the build matrix, please also check with the tools/deploy_to_maven.sh file
-# The file assumes a certain build order for the maven / nightly build deployments.
+# - define unique cache names in case the auto-generated ones are not unique
+#  (see https://docs.travis-ci.com/user/caching/#Caches-and-build-matrices)
+# - See https://issues.apache.org/jira/browse/FLINK-1072
 matrix:
   include:
     - jdk: "oraclejdk8"
-      env: PROFILE="-Dhadoop.version=2.7.2 -Dscala-2.11 -Pinclude-yarn-tests -Dmaven.javadoc.skip=true"
+      env:
+        - TEST="core"
+        - PROFILE="-Dhadoop.version=2.8.3"
+        - CACHE_NAME=JDK8_H280_CO
     - jdk: "oraclejdk8"
-      env: PROFILE="-Dhadoop.version=2.6.3 -Pinclude-yarn-tests -Dmaven.javadoc.skip=true"
-    - jdk: "openjdk7"
-      env: PROFILE="-Dhadoop.version=2.4.1 -Dscala-2.11 -Pinclude-yarn-tests"
-    - jdk: "oraclejdk7" # this uploads the Hadoop 2 build to Maven and S3
-      env: PROFILE="-Dhadoop.version=2.3.0"
-    - jdk: "openjdk7" # this uploads the Hadoop 1 build to Maven and S3
-      env: PROFILE="-Dhadoop.profile=1"
-
+      env:
+        - TEST="libraries"
+        - PROFILE="-Dhadoop.version=2.8.3"
+        - CACHE_NAME=JDK8_H280_L
+    - jdk: "oraclejdk8"
+      env:
+        - TEST="connectors"
+        - PROFILE="-Dhadoop.version=2.8.3 -Pinclude-kinesis"
+        - CACHE_NAME=JDK8_H280_CN
+    - jdk: "oraclejdk8"
+      env:
+        - TEST="tests"
+        - PROFILE="-Dhadoop.version=2.8.3"
+        - CACHE_NAME=JDK8_H280_T
+    - jdk: "oraclejdk8"
+      env:
+        - TEST="misc"
+        - PROFILE="-Dhadoop.version=2.8.3 -Dinclude_hadoop_aws"
+        - CACHE_NAME=JDK8_H280_M
+    - jdk: "openjdk8"
+      env:
+        - TEST="core"
+        - PROFILE="-Dhadoop.version=2.4.1 -DlegacyCode"
+        - CACHE_NAME=JDK8_H241_CO
+    - jdk: "openjdk8"
+      env:
+        - TEST="libraries"
+        - PROFILE="-Dhadoop.version=2.4.1 -DlegacyCode"
+        - CACHE_NAME=JDK8_H241_L
+    - jdk: "openjdk8"
+      env:
+        - TEST="connectors"
+        - PROFILE="-Dhadoop.version=2.4.1 -DlegacyCode -Pinclude-kinesis"
+        - CACHE_NAME=JDK8_H241_CN
+    - jdk: "openjdk8"
+      env:
+        - TEST="tests"
+        - PROFILE="-Dhadoop.version=2.4.1 -DlegacyCode"
+        - CACHE_NAME=JDK8_H241_T
+    - jdk: "openjdk8"
+      env:
+        - TEST="misc"
+        - PROFILE="-Dhadoop.version=2.4.1 -DlegacyCode"
+        - CACHE_NAME=JDK8_H241_M
 
 git:
   depth: 100
 
-notifications:
-  webhooks:
-    urls:
-      - https://webhooks.gitter.im/e/d70a7e674cb9354c77b2
-    on_success: always  # options: [always|never|change] default: always
-    on_failure: always  # options: [always|never|change] default: always
-  slack:
-    secure: iYjxJn8OkCRslJ30/PcE+EbMiqfKwsvUJiVUEQAEXqCEwZg+wYDsN0ilPQQT0zU16mYWKoMTx71zrOZpjirGq7ww0XZ0wAfXDjgmTxX/DaEdp87uNgTRdQzLV7mQouMKZni28eoa08Rb2NIoLLQ39q7uCu0W/p7vAD2e9xHlBBE=
 
 env:
     global:
         # Global variable to avoid hanging travis builds when downloading cache archives.
         - MALLOC_ARENA_MAX=2
         # Build artifacts like logs (variables for apache/flink repo)
-        - secure: "Fm3NK28qN8yLtpJl4VI58biBECpOodMYbYXPVWwa62R7jkhHl2U1s4Xa5ujEgNIDcsUsY66z0V4pU0Es0XLNOY2ajlaFOHTmngzFIXul1r4vuNy0H8okEBjs9Ks0TOWYrE6ndAv1J4/oUsRtehayrriaehn31emXL9c4RSKgaiQ="
-        - secure: "CGcWDpoPLKVPVxFCa+rh5svyrSy7tWTsydsFuLlw5BH5QR57FWH0P5ZBZ31MPppoNNpKEp1V5PBxOH0dUAx8SVNWQFNCsQrOwVpTnTlyl3Cd1udj2hahbB3l+IGf0+O3v2vv6blYm6vJb98NqzZknjdIefDDBfu52ndJy1UqHQw="
-        - secure: "J4IJ7ZG5X+x/2K00kCpj6N/j3wEc6vG59KdDFVZp1WnKH8H0cty2wujZvDhBV+krbqja2MHhXQt/2mDjqm7pkdk1YElDOWsx909aw29wUdDN4yOsxFekIa5jMCrcQxbwzDRal6JmAzCakk51qIEgCYuAKquT0N+oETmnOhmcQe0="
+        - secure: "gL3QRn6/XyVK+Em9RmVqpM6nbTwlhjK4/JiRYZGGCkBgTq4ZnG+Eq2qKAO22TAsqRSi7g7WAoAhUulPt0SJqH7hjMe0LetbO0izbVXDefwf2PJlsNgBbuFG6604++VUaUEyfPYYw9ADjV59LWG7+B/fjbRsevqRBZ30b1gv/tQQ="
+        - secure: "eM9r8IglvnUKctxz/ga6hwGnCpdOvGyYdGj0H/UiNDEx3Lq1A6yp3gChEIXGJqRUXDI5TaIuidunUGY7KHml8urm8eG2Yk2ttxXehZqLpEaOU2jdNJCdLX8tlVfh14T9bxG5AYHQEV3qJUqDFtfXD3whvzuinrm1oEIA3qUxiA8="
+        - secure: "EQYDWgJM5ANJ/sAFwmSEwSTOe9CDN/ENyQAr5/ntM67XanhTZj2Amgt9LthCRUU4EEPl/OFUTwNHMpv/+wa3q7dwVFldSIg5wyCndzJSATPyPBVjYgsXIQZVIjsq4TwTyrTteT55V6Oz2+l27Fvung2FPuN83ovswsJePFzMBxI="
 
 before_script:
    - "gem install --no-document --version 0.8.9 faraday "
+
+# Install maven 3.2.5 since trusty uses 3.3.9 for which shading is broken
+before_install:
+   - "wget https://archive.apache.org/dist/maven/maven-3/3.2.5/binaries/apache-maven-3.2.5-bin.zip"
+   - "unzip -qq apache-maven-3.2.5-bin.zip"
+   - "rm apache-maven-3.2.5-bin.zip"
+   - "export M2_HOME=$PWD/apache-maven-3.2.5"
+   - "export PATH=$M2_HOME/bin:$PATH"
+   - "export MAVEN_OPTS=\"-Dorg.slf4j.simpleLogger.showDateTime=true -Dorg.slf4j.simpleLogger.dateTimeFormat=HH:mm:ss.SSS\""
+# just in case: clean up the .m2 home and remove invalid jar files
+   - 'test ! -d $HOME/.m2/repository/ || find $HOME/.m2/repository/ -name "*.jar" -exec sh -c ''if ! zip -T {} >/dev/null ; then echo "deleting invalid file: {}"; rm -f {} ; fi'' \;'
 
 # We run mvn and monitor its output. If there is no output for the specified number of seconds, we
 # print the stack traces of all running Java processes.

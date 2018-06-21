@@ -19,6 +19,20 @@
 
 package org.apache.flink.runtime.operators;
 
+import org.apache.flink.api.common.io.DelimitedInputFormat;
+import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.runtime.operators.testutils.NirvanaOutputList;
+import org.apache.flink.runtime.operators.testutils.TaskCancelThread;
+import org.apache.flink.runtime.operators.testutils.TaskTestBase;
+import org.apache.flink.runtime.operators.testutils.UniformRecordGenerator;
+import org.apache.flink.types.IntValue;
+import org.apache.flink.types.Record;
+import org.apache.flink.util.MutableObjectIterator;
+
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Test;
+
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
@@ -29,26 +43,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 
-import org.apache.flink.api.common.io.DelimitedInputFormat;
-import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
-import org.apache.flink.runtime.taskmanager.Task;
-import org.junit.Assert;
-
-import org.apache.flink.runtime.operators.testutils.NirvanaOutputList;
-import org.apache.flink.runtime.operators.testutils.TaskCancelThread;
-import org.apache.flink.runtime.operators.testutils.TaskTestBase;
-import org.apache.flink.runtime.operators.testutils.UniformRecordGenerator;
-import org.apache.flink.types.IntValue;
-import org.apache.flink.types.Record;
-import org.apache.flink.util.MutableObjectIterator;
-import org.junit.After;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.powermock.core.classloader.annotations.PrepareForTest;
-import org.powermock.modules.junit4.PowerMockRunner;
-
-@RunWith(PowerMockRunner.class)
-@PrepareForTest({Task.class, ResultPartitionWriter.class})
 public class DataSourceTaskTest extends TaskTestBase {
 
 	private static final int MEMORY_MANAGER_SIZE = 1024 * 1024;
@@ -84,8 +78,8 @@ public class DataSourceTaskTest extends TaskTestBase {
 		super.initEnvironment(MEMORY_MANAGER_SIZE, NETWORK_BUFFER_SIZE);
 		super.addOutput(this.outList);
 		
-		DataSourceTask<Record> testTask = new DataSourceTask<>();
-		
+		DataSourceTask<Record> testTask = new DataSourceTask<>(this.mockEnv);
+
 		super.registerFileInputTask(testTask, MockInputFormat.class, new File(tempTestPath).toURI().toString(), "\n");
 		
 		try {
@@ -150,7 +144,7 @@ public class DataSourceTaskTest extends TaskTestBase {
 		super.initEnvironment(MEMORY_MANAGER_SIZE, NETWORK_BUFFER_SIZE);
 		super.addOutput(this.outList);
 		
-		DataSourceTask<Record> testTask = new DataSourceTask<>();
+		DataSourceTask<Record> testTask = new DataSourceTask<>(this.mockEnv);
 
 		super.registerFileInputTask(testTask, MockFailingInputFormat.class, new File(tempTestPath).toURI().toString(), "\n");
 		
@@ -184,7 +178,7 @@ public class DataSourceTaskTest extends TaskTestBase {
 			Assert.fail("Unable to set-up test input file");
 		}
 		
-		final DataSourceTask<Record> testTask = new DataSourceTask<>();
+		final DataSourceTask<Record> testTask = new DataSourceTask<>(this.mockEnv);
 
 		super.registerFileInputTask(testTask, MockDelayingInputFormat.class,  new File(tempTestPath).toURI().toString(), "\n");
 		
@@ -219,28 +213,26 @@ public class DataSourceTaskTest extends TaskTestBase {
 	
 	private static class InputFilePreparator {
 		public static void prepareInputFile(MutableObjectIterator<Record> inIt, String inputFilePath, boolean insertInvalidData)
-		throws IOException
-		{
-			FileWriter fw = new FileWriter(inputFilePath);
-			BufferedWriter bw = new BufferedWriter(fw);
-			
-			if (insertInvalidData) {
-				bw.write("####_I_AM_INVALID_########\n");
+		throws IOException {
+
+			try (BufferedWriter bw = new BufferedWriter(new FileWriter(inputFilePath))) {
+				if (insertInvalidData) {
+					bw.write("####_I_AM_INVALID_########\n");
+				}
+
+				Record rec = new Record();
+				while ((rec = inIt.next(rec)) != null) {
+					IntValue key = rec.getField(0, IntValue.class);
+					IntValue value = rec.getField(1, IntValue.class);
+
+					bw.write(key.getValue() + "_" + value.getValue() + "\n");
+				}
+				if (insertInvalidData) {
+					bw.write("####_I_AM_INVALID_########\n");
+				}
+
+				bw.flush();
 			}
-			
-			Record rec = new Record();
-			while ((rec = inIt.next(rec)) != null) {
-				IntValue key = rec.getField(0, IntValue.class);
-				IntValue value = rec.getField(1, IntValue.class);
-				
-				bw.write(key.getValue() + "_" + value.getValue() + "\n");
-			}
-			if (insertInvalidData) {
-				bw.write("####_I_AM_INVALID_########\n");
-			}
-			
-			bw.flush();
-			bw.close();
 		}
 	}
 	
@@ -256,7 +248,7 @@ public class DataSourceTaskTest extends TaskTestBase {
 		@Override
 		public Record readRecord(Record target, byte[] record, int offset, int numBytes) {
 			
-			String line = new String(record, offset, numBytes);
+			String line = new String(record, offset, numBytes, ConfigConstants.DEFAULT_CHARSET);
 			
 			try {
 				this.key.setValue(Integer.parseInt(line.substring(0,line.indexOf("_"))));
@@ -299,7 +291,7 @@ public class DataSourceTaskTest extends TaskTestBase {
 				return null;
 			}
 			
-			String line = new String(record, offset, numBytes);
+			String line = new String(record, offset, numBytes, ConfigConstants.DEFAULT_CHARSET);
 			
 			try {
 				this.key.setValue(Integer.parseInt(line.substring(0,line.indexOf("_"))));
@@ -333,7 +325,7 @@ public class DataSourceTaskTest extends TaskTestBase {
 			
 			this.cnt++;
 			
-			String line = new String(record, offset, numBytes);
+			String line = new String(record, offset, numBytes, ConfigConstants.DEFAULT_CHARSET);
 			
 			try {
 				this.key.setValue(Integer.parseInt(line.substring(0,line.indexOf("_"))));

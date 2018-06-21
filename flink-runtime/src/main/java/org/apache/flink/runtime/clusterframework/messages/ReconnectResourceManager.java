@@ -19,8 +19,10 @@
 package org.apache.flink.runtime.clusterframework.messages;
 
 import akka.actor.ActorRef;
-import com.google.common.base.Preconditions;
 import org.apache.flink.runtime.messages.RequiresLeaderSessionID;
+import org.apache.flink.util.Preconditions;
+
+import java.io.Serializable;
 
 /**
  * This message signals that the ResourceManager should reconnect to the JobManager. It is processed
@@ -28,21 +30,30 @@ import org.apache.flink.runtime.messages.RequiresLeaderSessionID;
  * the ResourceManager to go through the reconciliation phase to sync up with the JobManager bookkeeping.
  * This is done by forcing the ResourceManager to reconnect.
  */
-public class ReconnectResourceManager implements RequiresLeaderSessionID, java.io.Serializable {
+public class ReconnectResourceManager implements RequiresLeaderSessionID, Serializable {
 	private static final long serialVersionUID = 1L;
 
 	private final ActorRef resourceManager;
 
-	public ReconnectResourceManager(ActorRef resourceManager) {
+	private final long connectionId;
+
+	public ReconnectResourceManager(ActorRef resourceManager, long connectionId) {
 		this.resourceManager = Preconditions.checkNotNull(resourceManager);
+		this.connectionId = Preconditions.checkNotNull(connectionId);
 	}
 	
 	public ActorRef resourceManager() {
 		return resourceManager;
 	}
 
+	public long getConnectionId() {
+		return connectionId;
+	}
+
 	@Override
 	public String toString() {
-		return "ReconnectResourceManager " + resourceManager.path();
+		return "ReconnectResourceManager(" +
+			resourceManager.path() + ", " +
+			connectionId + ')';
 	}
 }

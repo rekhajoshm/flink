@@ -18,17 +18,19 @@
 
 package org.apache.flink.yarn
 
-import java.util.concurrent.ExecutorService
+import java.util.concurrent.{Executor, ScheduledExecutorService}
 
 import akka.actor.ActorRef
 import org.apache.flink.configuration.Configuration
-import org.apache.flink.runtime.checkpoint.{SavepointStore, CheckpointRecoveryFactory}
+import org.apache.flink.runtime.blob.BlobServer
+import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory
 import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager
 import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory
 import org.apache.flink.runtime.instance.InstanceManager
 import org.apache.flink.runtime.jobmanager.SubmittedJobGraphStore
 import org.apache.flink.runtime.jobmanager.scheduler.Scheduler
 import org.apache.flink.runtime.leaderelection.LeaderElectionService
+import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup
 import org.apache.flink.runtime.testingUtils.TestingJobManagerLike
 
 import scala.concurrent.duration.FiniteDuration
@@ -39,8 +41,9 @@ import scala.concurrent.duration.FiniteDuration
   * instead of an anonymous class with the respective mixin to obtain a more readable logger name.
   *
   * @param flinkConfiguration Configuration object for the actor
-  * @param executorService Execution context which is used to execute concurrent tasks in the
+  * @param futureExecutor Execution context which is used to execute concurrent tasks in the
   *                         [[org.apache.flink.runtime.executiongraph.ExecutionGraph]]
+  * @param ioExecutor for blocking io operations
   * @param instanceManager Instance manager to manage the registered
   *                        [[org.apache.flink.runtime.taskmanager.TaskManager]]
   * @param scheduler Scheduler to schedule Flink jobs
@@ -52,9 +55,11 @@ import scala.concurrent.duration.FiniteDuration
   */
 class TestingYarnJobManager(
     flinkConfiguration: Configuration,
-    executorService: ExecutorService,
+    futureExecutor: ScheduledExecutorService,
+    ioExecutor: Executor,
     instanceManager: InstanceManager,
     scheduler: Scheduler,
+    blobServer: BlobServer,
     libraryCacheManager: BlobLibraryCacheManager,
     archive: ActorRef,
     restartStrategyFactory: RestartStrategyFactory,
@@ -62,13 +67,16 @@ class TestingYarnJobManager(
     leaderElectionService: LeaderElectionService,
     submittedJobGraphs : SubmittedJobGraphStore,
     checkpointRecoveryFactory : CheckpointRecoveryFactory,
-    savepointStore: SavepointStore,
-    jobRecoveryTimeout: FiniteDuration)
+    jobRecoveryTimeout: FiniteDuration,
+    jobManagerMetricGroup : JobManagerMetricGroup,
+    optRestAddress: Option[String])
   extends YarnJobManager(
     flinkConfiguration,
-    executorService,
+    futureExecutor,
+    ioExecutor,
     instanceManager,
     scheduler,
+    blobServer,
     libraryCacheManager,
     archive,
     restartStrategyFactory,
@@ -76,6 +84,7 @@ class TestingYarnJobManager(
     leaderElectionService,
     submittedJobGraphs,
     checkpointRecoveryFactory,
-    savepointStore,
-    jobRecoveryTimeout)
+    jobRecoveryTimeout,
+    jobManagerMetricGroup,
+    optRestAddress)
   with TestingJobManagerLike {}

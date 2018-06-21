@@ -18,36 +18,114 @@
 
 package org.apache.flink.graph.utils;
 
-import org.apache.flink.api.common.JobExecutionResult;
-import org.apache.flink.api.java.Utils;
-import org.apache.flink.graph.Edge;
-import org.apache.flink.graph.Graph;
-import org.apache.flink.graph.Vertex;
-import org.apache.flink.util.AbstractID;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.DataSet;
+import org.apache.flink.api.java.functions.FunctionAnnotation.ForwardedFields;
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
+import org.apache.flink.api.java.typeutils.TypeExtractor;
+import org.apache.flink.graph.asm.translate.TranslateFunction;
+import org.apache.flink.types.LongValue;
 
+import static org.apache.flink.api.java.typeutils.ValueTypeInfo.LONG_VALUE_TYPE_INFO;
+
+/**
+ * {@link Graph} utilities.
+ */
 public class GraphUtils {
 
+	private GraphUtils() {}
+
 	/**
-	 * Convenience method to get the count (number of elements) of a Graph
-	 * as well as the checksum (sum over element hashes). The vertex and
-	 * edge DataSets are processed in a single job and the resultant counts
-	 * and checksums are merged locally.
+	 * Count the number of elements in a DataSet.
 	 *
-	 * @param graph Graph over which to compute the count and checksum
-	 * @return the checksum over the vertices and edges
+	 * @param input DataSet of elements to be counted
+	 * @param <T> element type
+	 * @return count
 	 */
-	public static <K, VV, EV> Utils.ChecksumHashCode checksumHashCode(Graph<K, VV, EV> graph) throws Exception {
-		final String verticesId = new AbstractID().toString();
-		graph.getVertices().output(new Utils.ChecksumHashCodeHelper<Vertex<K, VV>>(verticesId)).name("ChecksumHashCode vertices");
+	public static <T> DataSet<LongValue> count(DataSet<T> input) {
+		return input
+			.map(new MapTo<>(new LongValue(1)))
+				.returns(LONG_VALUE_TYPE_INFO)
+				.name("Emit 1")
+			.reduce(new AddLongValue())
+				.name("Sum");
+	}
 
-		final String edgesId = new AbstractID().toString();
-		graph.getEdges().output(new Utils.ChecksumHashCodeHelper<Edge<K, EV>>(edgesId)).name("ChecksumHashCode edges");
+	/**
+	 * The identity mapper returns the input as output.
+	 *
+	 * @param <T> element type
+	 */
+	@ForwardedFields("*")
+	public static final class IdentityMapper<T>
+	implements MapFunction<T, T> {
+		public T map(T value) {
+			return value;
+		}
+	}
 
-		JobExecutionResult res = graph.getContext().execute();
+	/**
+	 * The identity mapper returns the input as output.
+	 *
+	 * <p>This does not forward fields and is used to break an operator chain.
+	 *
+	 * @param <T> element type
+	 */
+	public static final class NonForwardingIdentityMapper<T>
+	implements MapFunction<T, T> {
+		public T map(T value) {
+			return value;
+		}
+	}
 
-		Utils.ChecksumHashCode checksum = res.<Utils.ChecksumHashCode>getAccumulatorResult(verticesId);
-		checksum.add(res.<Utils.ChecksumHashCode>getAccumulatorResult(edgesId));
+	/**
+	 * Map each element to a value.
+	 *
+	 * @param <I> input type
+	 * @param <O> output type
+	 */
+	public static class MapTo<I, O>
+	implements MapFunction<I, O>, ResultTypeQueryable<O>, TranslateFunction<I, O> {
+		private final O value;
 
-		return checksum;
+		/**
+		 * Map each element to the given object.
+		 *
+		 * @param value the object to emit for each element
+		 */
+		public MapTo(O value) {
+			this.value = value;
+		}
+
+		@Override
+		public O map(I input) throws Exception {
+			return value;
+		}
+
+		@Override
+		public O translate(I input, O reuse)
+				throws Exception {
+			return value;
+		}
+
+		@Override
+		public TypeInformation<O> getProducedType() {
+			return (TypeInformation<O>) TypeExtractor.createTypeInfo(value.getClass());
+		}
+	}
+
+	/**
+	 * Add {@link LongValue} elements.
+	 */
+	public static class AddLongValue
+	implements ReduceFunction<LongValue> {
+		@Override
+		public LongValue reduce(LongValue value1, LongValue value2)
+				throws Exception {
+			value1.setValue(value1.getValue() + value2.getValue());
+			return value1;
+		}
 	}
 }

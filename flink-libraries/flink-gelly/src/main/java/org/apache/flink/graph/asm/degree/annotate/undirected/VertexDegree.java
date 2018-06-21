@@ -18,17 +18,19 @@
 
 package org.apache.flink.graph.asm.degree.annotate.undirected;
 
-import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.operators.base.ReduceOperatorBase.CombineHint;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.graph.Edge;
 import org.apache.flink.graph.Graph;
-import org.apache.flink.graph.GraphAlgorithm;
 import org.apache.flink.graph.Vertex;
 import org.apache.flink.graph.asm.degree.annotate.DegreeAnnotationFunctions.DegreeCount;
 import org.apache.flink.graph.asm.degree.annotate.DegreeAnnotationFunctions.JoinVertexWithVertexDegree;
 import org.apache.flink.graph.asm.degree.annotate.DegreeAnnotationFunctions.MapEdgeToSourceId;
 import org.apache.flink.graph.asm.degree.annotate.DegreeAnnotationFunctions.MapEdgeToTargetId;
+import org.apache.flink.graph.utils.proxy.GraphAlgorithmWrappingBase;
+import org.apache.flink.graph.utils.proxy.GraphAlgorithmWrappingDataSet;
+import org.apache.flink.graph.utils.proxy.OptionalBoolean;
 import org.apache.flink.types.LongValue;
 
 /**
@@ -39,14 +41,12 @@ import org.apache.flink.types.LongValue;
  * @param <EV> edge value type
  */
 public class VertexDegree<K, VV, EV>
-implements GraphAlgorithm<K, VV, EV, DataSet<Vertex<K, LongValue>>> {
+extends GraphAlgorithmWrappingDataSet<K, VV, EV, Vertex<K, LongValue>> {
 
 	// Optional configuration
-	private boolean includeZeroDegreeVertices = false;
+	private OptionalBoolean includeZeroDegreeVertices = new OptionalBoolean(false, true);
 
-	private boolean reduceOnTargetId = false;
-
-	private int parallelism = ExecutionConfig.PARALLELISM_UNKNOWN;
+	private OptionalBoolean reduceOnTargetId = new OptionalBoolean(false, false);
 
 	/**
 	 * By default only the edge set is processed for the computation of degree.
@@ -58,7 +58,7 @@ implements GraphAlgorithm<K, VV, EV, DataSet<Vertex<K, LongValue>>> {
 	 * @return this
 	 */
 	public VertexDegree<K, VV, EV> setIncludeZeroDegreeVertices(boolean includeZeroDegreeVertices) {
-		this.includeZeroDegreeVertices = includeZeroDegreeVertices;
+		this.includeZeroDegreeVertices.set(includeZeroDegreeVertices);
 
 		return this;
 	}
@@ -73,52 +73,62 @@ implements GraphAlgorithm<K, VV, EV, DataSet<Vertex<K, LongValue>>> {
 	 * @return this
 	 */
 	public VertexDegree<K, VV, EV> setReduceOnTargetId(boolean reduceOnTargetId) {
-		this.reduceOnTargetId = reduceOnTargetId;
-
-		return this;
-	}
-
-	/**
-	 * Override the operator parallelism.
-	 *
-	 * @param parallelism operator parallelism
-	 * @return this
-	 */
-	public VertexDegree<K, VV, EV> setParallelism(int parallelism) {
-		this.parallelism = parallelism;
+		this.reduceOnTargetId.set(reduceOnTargetId);
 
 		return this;
 	}
 
 	@Override
-	public DataSet<Vertex<K, LongValue>> run(Graph<K, VV, EV> input)
+	protected boolean canMergeConfigurationWith(GraphAlgorithmWrappingBase other) {
+		if (!super.canMergeConfigurationWith(other)) {
+			return false;
+		}
+
+		VertexDegree rhs = (VertexDegree) other;
+
+		return !includeZeroDegreeVertices.conflictsWith(rhs.includeZeroDegreeVertices);
+	}
+
+	@Override
+	protected void mergeConfiguration(GraphAlgorithmWrappingBase other) {
+		super.mergeConfiguration(other);
+
+		VertexDegree rhs = (VertexDegree) other;
+
+		includeZeroDegreeVertices.mergeWith(rhs.includeZeroDegreeVertices);
+		reduceOnTargetId.mergeWith(rhs.reduceOnTargetId);
+	}
+
+	@Override
+	public DataSet<Vertex<K, LongValue>> runInternal(Graph<K, VV, EV> input)
 			throws Exception {
-		MapFunction<Edge<K, EV>, Vertex<K, LongValue>> mapEdgeToId = reduceOnTargetId ?
-			new MapEdgeToTargetId<K, EV>() : new MapEdgeToSourceId<K, EV>();
+		MapFunction<Edge<K, EV>, Vertex<K, LongValue>> mapEdgeToId = reduceOnTargetId.get() ?
+			new MapEdgeToTargetId<>() : new MapEdgeToSourceId<>();
 
 		// v
 		DataSet<Vertex<K, LongValue>> vertexIds = input
 			.getEdges()
 			.map(mapEdgeToId)
 				.setParallelism(parallelism)
-				.name("Map edge to vertex ID");
+				.name("Edge to vertex ID");
 
 		// v, deg(v)
 		DataSet<Vertex<K, LongValue>> degree = vertexIds
 			.groupBy(0)
-			.reduce(new DegreeCount<K>())
+			.reduce(new DegreeCount<>())
+			.setCombineHint(CombineHint.HASH)
 				.setParallelism(parallelism)
 				.name("Degree count");
 
-		if (includeZeroDegreeVertices) {
+		if (includeZeroDegreeVertices.get()) {
 			degree = input
 				.getVertices()
 				.leftOuterJoin(degree)
 				.where(0)
 				.equalTo(0)
-				.with(new JoinVertexWithVertexDegree<K, VV>())
+				.with(new JoinVertexWithVertexDegree<>())
 					.setParallelism(parallelism)
-					.name("Join zero degree vertices");
+					.name("Zero degree vertices");
 		}
 
 		return degree;

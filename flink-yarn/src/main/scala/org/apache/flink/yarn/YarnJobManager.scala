@@ -18,40 +18,41 @@
 
 package org.apache.flink.yarn
 
-import java.util.concurrent.{TimeUnit, ExecutorService}
+import java.io.IOException
+import java.util.concurrent.{Executor, ScheduledExecutorService, TimeUnit}
 
 import akka.actor.ActorRef
-
-import org.apache.flink.api.common.JobID
-import org.apache.flink.configuration.{Configuration => FlinkConfiguration, ConfigConstants}
-import org.apache.flink.runtime.checkpoint.{SavepointStore, CheckpointRecoveryFactory}
-import org.apache.flink.runtime.clusterframework.ApplicationStatus
-import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory
-import org.apache.flink.runtime.clusterframework.messages._
-import org.apache.flink.runtime.jobgraph.JobStatus
-import org.apache.flink.runtime.jobmanager.{SubmittedJobGraphStore, JobManager}
-import org.apache.flink.runtime.leaderelection.LeaderElectionService
-import org.apache.flink.runtime.messages.JobManagerMessages.{RequestJobStatus, CurrentJobStatus, JobNotFound}
-import org.apache.flink.runtime.messages.Messages.Acknowledge
+import org.apache.flink.configuration.{Configuration => FlinkConfiguration}
+import org.apache.flink.core.fs.Path
+import org.apache.flink.runtime.blob.BlobServer
+import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory
+import org.apache.flink.runtime.clusterframework.ContaineredJobManager
+import org.apache.flink.runtime.clusterframework.messages.StopCluster
 import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager
+import org.apache.flink.runtime.executiongraph.restart.RestartStrategyFactory
 import org.apache.flink.runtime.instance.InstanceManager
 import org.apache.flink.runtime.jobmanager.scheduler.{Scheduler => FlinkScheduler}
-
+import org.apache.flink.runtime.jobmanager.{JobManager, SubmittedJobGraphStore}
+import org.apache.flink.runtime.leaderelection.LeaderElectionService
+import org.apache.flink.runtime.metrics.MetricRegistryImpl
+import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup
+import org.apache.flink.yarn.configuration.YarnConfigOptions
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
-
 
 /** JobManager actor for execution on Yarn. It enriches the [[JobManager]] with additional messages
   * to start/administer/stop the Yarn session.
   *
   * @param flinkConfiguration Configuration object for the actor
-  * @param executorService Execution context which is used to execute concurrent tasks in the
+  * @param futureExecutor Execution context which is used to execute concurrent tasks in the
   *                         [[org.apache.flink.runtime.executiongraph.ExecutionGraph]]
+  * @param ioExecutor for blocking io operations
   * @param instanceManager Instance manager to manage the registered
   *                        [[org.apache.flink.runtime.taskmanager.TaskManager]]
   * @param scheduler Scheduler to schedule Flink jobs
-  * @param libraryCacheManager Manager to manage uploaded jar files
+  * @param blobServer BLOB store for file uploads
+  * @param libraryCacheManager manages uploaded jar files and class paths
   * @param archive Archive for finished Flink jobs
   * @param restartStrategyFactory Restart strategy to be used in case of a job recovery
   * @param timeout Timeout for futures
@@ -59,9 +60,11 @@ import scala.language.postfixOps
   */
 class YarnJobManager(
     flinkConfiguration: FlinkConfiguration,
-    executorService: ExecutorService,
+    futureExecutor: ScheduledExecutorService,
+    ioExecutor: Executor,
     instanceManager: InstanceManager,
     scheduler: FlinkScheduler,
+    blobServer: BlobServer,
     libraryCacheManager: BlobLibraryCacheManager,
     archive: ActorRef,
     restartStrategyFactory: RestartStrategyFactory,
@@ -69,13 +72,16 @@ class YarnJobManager(
     leaderElectionService: LeaderElectionService,
     submittedJobGraphs : SubmittedJobGraphStore,
     checkpointRecoveryFactory : CheckpointRecoveryFactory,
-    savepointStore: SavepointStore,
-    jobRecoveryTimeout: FiniteDuration)
-  extends JobManager(
+    jobRecoveryTimeout: FiniteDuration,
+    jobManagerMetricGroup: JobManagerMetricGroup,
+    optRestAddress: Option[String])
+  extends ContaineredJobManager(
     flinkConfiguration,
-    executorService,
+    futureExecutor,
+    ioExecutor,
     instanceManager,
     scheduler,
+    blobServer,
     libraryCacheManager,
     archive,
     restartStrategyFactory,
@@ -83,94 +89,51 @@ class YarnJobManager(
     leaderElectionService,
     submittedJobGraphs,
     checkpointRecoveryFactory,
-    savepointStore,
-    jobRecoveryTimeout) {
+    jobRecoveryTimeout,
+    jobManagerMetricGroup,
+    optRestAddress) {
 
   val DEFAULT_YARN_HEARTBEAT_DELAY: FiniteDuration = 5 seconds
   val YARN_HEARTBEAT_DELAY: FiniteDuration =
     FiniteDuration(
-      flinkConfiguration.getInteger(ConfigConstants.YARN_HEARTBEAT_DELAY_SECONDS, 5),
+      flinkConfiguration.getInteger(YarnConfigOptions.HEARTBEAT_DELAY_SECONDS),
       TimeUnit.SECONDS)
 
-  // indicates if this AM has been started in a detached mode.
-  var stopWhenJobFinished: JobID = null
+  val yarnFilesPath: Option[String] = Option(System.getenv().get(YarnConfigKeys.FLINK_YARN_FILES))
+
+  override val jobPollingInterval = YARN_HEARTBEAT_DELAY
 
   override def handleMessage: Receive = {
-    handleYarnMessage orElse super.handleMessage
+    handleYarnShutdown orElse super.handleMessage
   }
 
-  def handleYarnMessage: Receive = {
+  private def handleYarnShutdown: Receive = {
+    case msg: StopCluster =>
+      // do global cleanup if the yarn files path has been set
+      yarnFilesPath match {
+        case Some(filePath) =>
+          log.info(s"Deleting yarn application files under $filePath.")
 
-    case msg @ (_: RegisterInfoMessageListener | _: UnRegisterInfoMessageListener) =>
-      // forward to ResourceManager
-      currentResourceManager match {
-        case Some(rm) =>
-          // we forward the message
-          rm.forward(decorateMessage(msg))
+          val path = new Path(filePath)
+
+          try {
+            val fs = path.getFileSystem
+
+            if (!fs.delete(path, true)) {
+              throw new IOException(s"Deleting yarn application files under $filePath " +
+                s"was unsuccessful.")
+            }
+          } catch {
+            case ioe: IOException =>
+              log.warn(
+                s"Could not properly delete yarn application files directory $filePath.",
+                ioe)
+          }
         case None =>
-          // client has to try again
+          log.debug("No yarn application files directory set. Therefore, cannot clean up " +
+            "the data.")
       }
 
-    case msg: ShutdownClusterAfterJob =>
-      val jobId = msg.jobId()
-      log.info(s"ApplicatonMaster will shut down YARN session when job $jobId has finished.")
-      stopWhenJobFinished = jobId
-      // trigger regular job status messages (if this is a per-job yarn cluster)
-      if (stopWhenJobFinished != null) {
-        context.system.scheduler.schedule(0 seconds,
-          YARN_HEARTBEAT_DELAY,
-          new Runnable {
-            override def run(): Unit = {
-              self ! decorateMessage(RequestJobStatus(stopWhenJobFinished))
-            }
-          }
-        )(context.dispatcher)
-      }
-
-      sender() ! decorateMessage(Acknowledge)
-
-    case msg: GetClusterStatus =>
-      sender() ! decorateMessage(
-        new GetClusterStatusResponse(
-          instanceManager.getNumberOfRegisteredTaskManagers,
-          instanceManager.getTotalNumberOfSlots)
-      )
-
-    case jnf: JobNotFound =>
-      log.warn(s"Job with ID ${jnf.jobID} not found in JobManager")
-      if (stopWhenJobFinished == null) {
-        log.warn("The ApplicationMaster didn't expect to receive this message")
-      }
-
-    case jobStatus: CurrentJobStatus =>
-      if (stopWhenJobFinished == null) {
-        log.warn(s"Received job status $jobStatus which wasn't requested.")
-      } else {
-        if (stopWhenJobFinished != jobStatus.jobID) {
-          log.warn(s"Received job status for job ${jobStatus.jobID} but expected status for " +
-            s"job $stopWhenJobFinished")
-        } else {
-          if (jobStatus.status.isTerminalState) {
-            log.info(s"Job with ID ${jobStatus.jobID} is in terminal state ${jobStatus.status}. " +
-              s"Shutting down YARN session")
-            if (jobStatus.status == JobStatus.FINISHED) {
-              self ! decorateMessage(
-                new StopCluster(
-                  ApplicationStatus.SUCCEEDED,
-                  s"The monitored job with ID ${jobStatus.jobID} has finished.")
-              )
-            } else {
-              self ! decorateMessage(
-                new StopCluster(
-                  ApplicationStatus.FAILED,
-                  s"The monitored job with ID ${jobStatus.jobID} has failed to complete.")
-              )
-            }
-          } else {
-            log.debug(s"Monitored job with ID ${jobStatus.jobID} is in state ${jobStatus.status}")
-          }
-        }
-      }
+      super.handleMessage(msg)
   }
-
 }

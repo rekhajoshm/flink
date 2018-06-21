@@ -19,23 +19,23 @@
 package org.apache.flink.streaming.api.scala
 
 import com.esotericsoftware.kryo.Serializer
-
-import org.apache.flink.annotation.{Internal, PublicEvolving, Public}
-import org.apache.flink.api.common.io.{FileInputFormat, InputFormat}
+import org.apache.flink.annotation.{Internal, Public, PublicEvolving}
+import org.apache.flink.api.common.io.{FileInputFormat, FilePathFilter, InputFormat}
 import org.apache.flink.api.common.restartstrategy.RestartStrategies.RestartStrategyConfiguration
 import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable
 import org.apache.flink.api.java.typeutils.runtime.kryo.KryoSerializer
 import org.apache.flink.api.scala.ClosureCleaner
+import org.apache.flink.configuration.Configuration
 import org.apache.flink.runtime.state.AbstractStateBackend
+import org.apache.flink.runtime.state.StateBackend
 import org.apache.flink.streaming.api.environment.{StreamExecutionEnvironment => JavaEnv}
-import org.apache.flink.streaming.api.functions.source.FileMonitoringFunction.WatchType
-import org.apache.flink.streaming.api.functions.source.SourceFunction
+import org.apache.flink.streaming.api.functions.source._
 import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceContext
 import org.apache.flink.streaming.api.{CheckpointingMode, TimeCharacteristic}
 import org.apache.flink.util.SplittableIterator
 
 import scala.collection.JavaConverters._
-
 import _root_.scala.language.implicitConversions
 
 @Public
@@ -52,6 +52,11 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
   def getConfig = javaEnv.getConfig
 
   /**
+    * Gets cache files.
+    */
+  def getCachedFiles = javaEnv.getCachedFiles
+
+  /**
    * Sets the parallelism for operations executed through this environment.
    * Setting a parallelism of x here will cause all operators (such as join, map, reduce) to run
    * with x parallel instances. This value can be overridden by specific operations using
@@ -62,10 +67,28 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
   }
 
   /**
+    * Sets the maximum degree of parallelism defined for the program.
+    * The maximum degree of parallelism specifies the upper limit for dynamic scaling. It also
+    * defines the number of key groups used for partitioned state.
+    **/
+  def setMaxParallelism(maxParallelism: Int): Unit = {
+    javaEnv.setMaxParallelism(maxParallelism)
+  }
+
+  /**
    * Returns the default parallelism for this execution environment. Note that this
    * value can be overridden by individual operations using [[DataStream#setParallelism(int)]]
    */
   def getParallelism = javaEnv.getParallelism
+
+  /**
+    * Returns the maximum degree of parallelism defined for the program.
+    *
+    * The maximum degree of parallelism specifies the upper limit for dynamic scaling. It also
+    * defines the number of key groups used for partitioned state.
+    *
+    */
+  def getMaxParallelism = javaEnv.getMaxParallelism
 
   /**
    * Sets the maximum time frequency (milliseconds) for the flushing of the
@@ -203,35 +226,45 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
   def getCheckpointingMode = javaEnv.getCheckpointingMode()
 
   /**
-   * Sets the state backend that describes how to store and checkpoint operator state.
-   * It defines in what form the key/value state, accessible from operations on
-   * [[KeyedStream]] is maintained (heap, managed memory, externally), and where state
-   * snapshots/checkpoints are stored, both for the key/value state, and for checkpointed
-   * functions (implementing the interface 
-   * [[org.apache.flink.streaming.api.checkpoint.Checkpointed]].
+   * Sets the state backend that describes how to store and checkpoint operator state. It defines
+   * both which data structures hold state during execution (for example hash tables, RockDB,
+   * or other data stores) as well as where checkpointed data will be persisted.
    *
-   * <p>The [[org.apache.flink.runtime.state.memory.MemoryStateBackend]] for example
-   * maintains the state in heap memory, as objects. It is lightweight without extra 
-   * dependencies, but can checkpoint only small states (some counters).
+   * State managed by the state backend includes both keyed state that is accessible on
+   * [[org.apache.flink.streaming.api.datastream.KeyedStream keyed streams]], as well as
+   * state maintained directly by the user code that implements
+   * [[org.apache.flink.streaming.api.checkpoint.CheckpointedFunction CheckpointedFunction]].
    *
-   * <p>In contrast, the [[org.apache.flink.runtime.state.filesystem.FsStateBackend]]
-   * stores checkpoints of the state (also maintained as heap objects) in files. When using
-   * a replicated file system (like HDFS, S3, MapR FS, Tachyon, etc) this will guarantee
-   * that state is not lost upon failures of individual nodes and that the entire streaming
-   * program can be executed highly available and strongly consistent (assuming that Flink
-   * is run in high-availability mode).
+   * The [[org.apache.flink.runtime.state.memory.MemoryStateBackend]], for example,
+   * maintains the state in heap memory, as objects. It is lightweight without extra dependencies,
+   * but can checkpoint only small states (some counters).
+   *
+   * In contrast, the [[org.apache.flink.runtime.state.filesystem.FsStateBackend]]
+   * stores checkpoints of the state (also maintained as heap objects) in files.
+   * When using a replicated file system (like HDFS, S3, MapR FS, Tachyon, etc) this will guarantee
+   * that state is not lost upon failures of individual nodes and that streaming program can be
+   * executed highly available and strongly consistent.
    */
   @PublicEvolving
-  def setStateBackend(backend: AbstractStateBackend): StreamExecutionEnvironment = {
+  def setStateBackend(backend: StateBackend): StreamExecutionEnvironment = {
     javaEnv.setStateBackend(backend)
     this
+  }
+
+  /**
+   * @deprecated Use [[StreamExecutionEnvironment.setStateBackend(StateBackend)]] instead.
+   */
+  @Deprecated
+  @PublicEvolving
+  def setStateBackend(backend: AbstractStateBackend): StreamExecutionEnvironment = {
+    setStateBackend(backend.asInstanceOf[StateBackend])
   }
 
   /**
    * Returns the state backend that defines how to store and checkpoint state.
    */
   @PublicEvolving
-  def getStateBackend: AbstractStateBackend = javaEnv.getStateBackend()
+  def getStateBackend: StateBackend = javaEnv.getStateBackend()
 
   /**
     * Sets the restart strategy configuration. The configuration specifies which restart strategy
@@ -454,18 +487,94 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
         DataStream[T] =
     asScalaStream(javaEnv.readFile(inputFormat, filePath))
 
+  /**
+    * Creates a DataStream that contains the contents of file created while
+    * system watches the given path. The file will be read with the system's
+    * default character set. The user can check the monitoring interval in milliseconds,
+    * and the way file modifications are handled. By default it checks for only new files
+    * every 100 milliseconds.
+    *
+    */
+  @Deprecated
+  def readFileStream(StreamPath: String, intervalMillis: Long = 100,
+                     watchType: FileMonitoringFunction.WatchType =
+                     FileMonitoringFunction.WatchType.ONLY_NEW_FILES): DataStream[String] =
+    asScalaStream(javaEnv.readFileStream(StreamPath, intervalMillis, watchType))
 
   /**
-   * Creates a DataStream that contains the contents of file created while
-   * system watches the given path. The file will be read with the system's
-   * default character set. The user can check the monitoring interval in milliseconds,
-   * and the way file modifications are handled. By default it checks for only new files
-   * every 100 milliseconds.
-   *
-   */
-  def readFileStream(StreamPath: String, intervalMillis: Long = 100, 
-                     watchType: WatchType = WatchType.ONLY_NEW_FILES): DataStream[String] =
-    asScalaStream(javaEnv.readFileStream(StreamPath, intervalMillis, watchType))
+    * Reads the contents of the user-specified path based on the given [[FileInputFormat]].
+    * Depending on the provided [[FileProcessingMode]].
+    *
+    * @param inputFormat
+    *          The input format used to create the data stream
+    * @param filePath
+    *          The path of the file, as a URI (e.g., "file:///some/local/file" or
+    *          "hdfs://host:port/file/path")
+    * @param watchType
+    *          The mode in which the source should operate, i.e. monitor path and react
+    *          to new data, or process once and exit
+    * @param interval
+    *          In the case of periodic path monitoring, this specifies the interval (in millis)
+    *          between consecutive path scans
+    * @param filter
+    *          The files to be excluded from the processing
+    * @return The data stream that represents the data read from the given file
+   * @deprecated Use [[FileInputFormat#setFilesFilter(FilePathFilter)]] to set a filter and
+    * [[StreamExecutionEnvironment#readFile(FileInputFormat, String, FileProcessingMode, long)]]
+    */
+  @PublicEvolving
+  @Deprecated
+  def readFile[T: TypeInformation](
+                                    inputFormat: FileInputFormat[T],
+                                    filePath: String,
+                                    watchType: FileProcessingMode,
+                                    interval: Long,
+                                    filter: FilePathFilter): DataStream[T] = {
+    asScalaStream(javaEnv.readFile(inputFormat, filePath, watchType, interval, filter))
+  }
+
+  /**
+    * Reads the contents of the user-specified path based on the given [[FileInputFormat]].
+    * Depending on the provided [[FileProcessingMode]], the source
+    * may periodically monitor (every `interval` ms) the path for new data
+    * ([[FileProcessingMode.PROCESS_CONTINUOUSLY]]), or process
+    * once the data currently in the path and exit
+    * ([[FileProcessingMode.PROCESS_ONCE]]). In addition,
+    * if the path contains files not to be processed, the user can specify a custom
+    * [[FilePathFilter]]. As a default implementation you can use
+    * [[FilePathFilter.createDefaultFilter()]].
+    *
+    * ** NOTES ON CHECKPOINTING: ** If the `watchType` is set to
+    * [[FileProcessingMode#PROCESS_ONCE]], the source monitors the path ** once **,
+    * creates the [[org.apache.flink.core.fs.FileInputSplit FileInputSplits]]
+    * to be processed, forwards them to the downstream
+    * [[ContinuousFileReaderOperator readers]] to read the actual data,
+    * and exits, without waiting for the readers to finish reading. This
+    * implies that no more checkpoint barriers are going to be forwarded
+    * after the source exits, thus having no checkpoints after that point.
+    *
+    * @param inputFormat
+    *          The input format used to create the data stream
+    * @param filePath
+    *          The path of the file, as a URI (e.g., "file:///some/local/file" or
+    *          "hdfs://host:port/file/path")
+    * @param watchType
+    *          The mode in which the source should operate, i.e. monitor path and react
+    *          to new data, or process once and exit
+    * @param interval
+    *          In the case of periodic path monitoring, this specifies the interval (in millis)
+    *          between consecutive path scans
+    * @return The data stream that represents the data read from the given file
+    */
+  @PublicEvolving
+  def readFile[T: TypeInformation](
+      inputFormat: FileInputFormat[T],
+      filePath: String,
+      watchType: FileProcessingMode,
+      interval: Long): DataStream[T] = {
+    val typeInfo = implicitly[TypeInformation[T]]
+    asScalaStream(javaEnv.readFile(inputFormat, filePath, watchType, interval, typeInfo))
+  }
 
   /**
    * Creates a new DataStream that contains the strings received infinitely
@@ -486,7 +595,11 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
    */
   @PublicEvolving
   def createInput[T: TypeInformation](inputFormat: InputFormat[T, _]): DataStream[T] =
-    asScalaStream(javaEnv.createInput(inputFormat))
+    if (inputFormat.isInstanceOf[ResultTypeQueryable[_]]) {
+      asScalaStream(javaEnv.createInput(inputFormat))
+    } else {
+      asScalaStream(javaEnv.createInput(inputFormat, implicitly[TypeInformation[T]]))
+    }
 
   /**
    * Create a DataStream using a user defined source function for arbitrary
@@ -576,6 +689,45 @@ class StreamExecutionEnvironment(javaEnv: JavaEnv) {
     }
     f
   }
+
+  /**
+    * Registers a file at the distributed cache under the given name. The file will be accessible
+    * from any user-defined function in the (distributed) runtime under a local path. Files
+    * may be local files (which will be distributed via BlobServer), or files in a distributed file
+    * system. The runtime will copy the files temporarily to a local cache, if needed.
+    *
+    * The {@link org.apache.flink.api.common.functions.RuntimeContext} can be obtained inside UDFs
+    * via {@link org.apache.flink.api.common.functions.RichFunction#getRuntimeContext()} and
+    * provides access {@link org.apache.flink.api.common.cache.DistributedCache} via
+    * {@link org.apache.flink.api.common.functions.RuntimeContext#getDistributedCache()}.
+    *
+    * @param filePath The path of the file, as a URI (e.g. "file:///some/path" or
+    *                 "hdfs://host:port/and/path")
+    * @param name     The name under which the file is registered.
+    */
+  def registerCachedFile(filePath: String, name: String): Unit = {
+    javaEnv.registerCachedFile(filePath, name)
+  }
+
+  /**
+    * Registers a file at the distributed cache under the given name. The file will be accessible
+    * from any user-defined function in the (distributed) runtime under a local path. Files
+    * may be local files (which will be distributed via BlobServer), or files in a distributed file
+    * system. The runtime will copy the files temporarily to a local cache, if needed.
+    *
+    * The {@link org.apache.flink.api.common.functions.RuntimeContext} can be obtained inside UDFs
+    * via {@link org.apache.flink.api.common.functions.RichFunction#getRuntimeContext()} and
+    * provides access {@link org.apache.flink.api.common.cache.DistributedCache} via
+    * {@link org.apache.flink.api.common.functions.RuntimeContext#getDistributedCache()}.
+    *
+    * @param filePath   The path of the file, as a URI (e.g. "file:///some/path" or
+    *                   "hdfs://host:port/and/path")
+    * @param name       The name under which the file is registered.
+    * @param executable flag indicating whether the file should be executable
+    */
+  def registerCachedFile(filePath: String, name: String, executable: Boolean): Unit = {
+    javaEnv.registerCachedFile(filePath, name, executable)
+  }
 }
 
 object StreamExecutionEnvironment {
@@ -584,13 +736,23 @@ object StreamExecutionEnvironment {
    * Sets the default parallelism that will be used for the local execution
    * environment created by [[createLocalEnvironment()]].
    *
-   * @param parallelism
-   * The parallelism to use as the default local parallelism.
+   * @param parallelism The default parallelism to use for local execution.
    */
   @PublicEvolving
   def setDefaultLocalParallelism(parallelism: Int) : Unit =
-    StreamExecutionEnvironment.setDefaultLocalParallelism(parallelism)
+    JavaEnv.setDefaultLocalParallelism(parallelism)
 
+  /**
+   * Gets the default parallelism that will be used for the local execution environment created by
+   * [[createLocalEnvironment()]].
+   */
+  @PublicEvolving
+  def getDefaultLocalParallelism: Int = JavaEnv.getDefaultLocalParallelism
+  
+  // --------------------------------------------------------------------------
+  //  context environment
+  // --------------------------------------------------------------------------
+  
   /**
    * Creates an execution environment that represents the context in which the program is
    * currently executed. If the program is invoked standalone, this method returns a local
@@ -601,16 +763,57 @@ object StreamExecutionEnvironment {
     new StreamExecutionEnvironment(JavaEnv.getExecutionEnvironment)
   }
 
+  // --------------------------------------------------------------------------
+  //  local environment
+  // --------------------------------------------------------------------------
+
   /**
-   * Creates a local execution environment. The local execution environment will run the program in
-   * a multi-threaded fashion in the same JVM as the environment was created in. The default degree
-   * of parallelism of the local environment is the number of hardware contexts (CPU cores/threads).
+   * Creates a local execution environment. The local execution environment will run the
+   * program in a multi-threaded fashion in the same JVM as the environment was created in.
+   *
+   * This method sets the environment's default parallelism to given parameter, which
+   * defaults to the value set via [[setDefaultLocalParallelism(Int)]].
    */
-  def createLocalEnvironment(
-    parallelism: Int =  Runtime.getRuntime.availableProcessors()):
-  StreamExecutionEnvironment = {
+  def createLocalEnvironment(parallelism: Int = JavaEnv.getDefaultLocalParallelism):
+      StreamExecutionEnvironment = {
     new StreamExecutionEnvironment(JavaEnv.createLocalEnvironment(parallelism))
   }
+
+  /**
+   * Creates a local execution environment. The local execution environment will run the
+   * program in a multi-threaded fashion in the same JVM as the environment was created in.
+   *
+   * @param parallelism   The parallelism for the local environment.
+   * @param configuration Pass a custom configuration into the cluster.
+   */
+  def createLocalEnvironment(parallelism: Int, configuration: Configuration):
+  StreamExecutionEnvironment = {
+    new StreamExecutionEnvironment(JavaEnv.createLocalEnvironment(parallelism, configuration))
+  }
+
+  /**
+   * Creates a [[StreamExecutionEnvironment]] for local program execution that also starts the
+   * web monitoring UI.
+   *
+   * The local execution environment will run the program in a multi-threaded fashion in
+   * the same JVM as the environment was created in. It will use the parallelism specified in the
+   * parameter.
+   *
+   * If the configuration key 'rest.port' was set in the configuration, that particular
+   * port will be used for the web UI. Otherwise, the default port (8081) will be used.
+   *
+   * @param config optional config for the local execution
+   * @return The created StreamExecutionEnvironment
+   */
+  @PublicEvolving
+  def createLocalEnvironmentWithWebUI(config: Configuration = null): StreamExecutionEnvironment = {
+    val conf: Configuration = if (config == null) new Configuration() else config
+    new StreamExecutionEnvironment(JavaEnv.createLocalEnvironmentWithWebUI(conf))
+  }
+
+  // --------------------------------------------------------------------------
+  //  remote environment
+  // --------------------------------------------------------------------------
 
   /**
    * Creates a remote execution environment. The remote environment sends (parts of) the program to
@@ -648,10 +851,11 @@ object StreamExecutionEnvironment {
    *                 provided in the JAR files.
    */
   def createRemoteEnvironment(
-    host: String,
-    port: Int,
-    parallelism: Int,
-    jarFiles: String*): StreamExecutionEnvironment = {
+      host: String,
+      port: Int,
+      parallelism: Int,
+      jarFiles: String*): StreamExecutionEnvironment = {
+
     val javaEnv = JavaEnv.createRemoteEnvironment(host, port, jarFiles: _*)
     javaEnv.setParallelism(parallelism)
     new StreamExecutionEnvironment(javaEnv)

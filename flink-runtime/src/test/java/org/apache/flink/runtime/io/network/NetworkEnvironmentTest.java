@@ -19,217 +19,344 @@
 package org.apache.flink.runtime.io.network;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.core.memory.MemoryType;
-import org.apache.flink.runtime.instance.ActorGateway;
-import org.apache.flink.runtime.instance.DummyActorGateway;
+import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
-import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
-import org.apache.flink.runtime.io.network.buffer.BufferPool;
-import org.apache.flink.runtime.io.network.netty.NettyConfig;
+import org.apache.flink.runtime.io.network.buffer.NetworkBufferPool;
 import org.apache.flink.runtime.io.network.partition.ResultPartition;
+import org.apache.flink.runtime.io.network.partition.ResultPartitionConsumableNotifier;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
+import org.apache.flink.runtime.io.network.partition.ResultPartitionManager;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.io.network.partition.consumer.RemoteInputChannel;
 import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
-import org.apache.flink.runtime.messages.JobManagerMessages.ScheduleOrUpdateConsumers;
-import org.apache.flink.runtime.taskmanager.NetworkEnvironmentConfiguration;
+import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
+import org.apache.flink.runtime.query.KvStateRegistry;
 import org.apache.flink.runtime.taskmanager.Task;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
-import org.apache.flink.util.NetUtils;
+import org.apache.flink.runtime.taskmanager.TaskActions;
+
+import org.junit.Rule;
 import org.junit.Test;
-import scala.Some;
-import scala.Tuple2;
-import scala.concurrent.duration.FiniteDuration;
-import scala.concurrent.impl.Promise;
+import org.junit.rules.ExpectedException;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
-import java.net.InetAddress;
-import java.util.concurrent.TimeUnit;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
 
+import static org.apache.flink.runtime.io.network.partition.InputChannelTestUtils.createDummyConnectionManager;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyObject;
-import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.powermock.api.mockito.PowerMockito.spy;
 
+/**
+ * Various tests for the {@link NetworkEnvironment} class.
+ */
+@RunWith(Parameterized.class)
 public class NetworkEnvironmentTest {
+	private static final int numBuffers = 1024;
 
-	@Test
-	public void testAssociateDisassociate() {
-		final int BUFFER_SIZE = 1024;
-		final int NUM_BUFFERS = 20;
+	private static final int memorySegmentSize = 128;
 
-		final int port;
-		try {
-			port = NetUtils.getAvailablePort();
-		}
-		catch (Throwable t) {
-			// ignore
-			return;
-		}
+	@Parameterized.Parameter
+	public boolean enableCreditBasedFlowControl;
 
-		try {
-			NettyConfig nettyConf = new NettyConfig(InetAddress.getLocalHost(), port, BUFFER_SIZE, 1, new Configuration());
-			NetworkEnvironmentConfiguration config = new NetworkEnvironmentConfiguration(
-					NUM_BUFFERS, BUFFER_SIZE, MemoryType.HEAP,
-					IOManager.IOMode.SYNC, new Some<>(nettyConf),
-					new Tuple2<>(0, 0));
-
-			NetworkEnvironment env = new NetworkEnvironment(
-				TestingUtils.defaultExecutionContext(),
-				new FiniteDuration(30, TimeUnit.SECONDS),
-				config);
-
-			assertFalse(env.isShutdown());
-			assertFalse(env.isAssociated());
-
-			// pool must be started already
-			assertNotNull(env.getNetworkBufferPool());
-			assertEquals(NUM_BUFFERS, env.getNetworkBufferPool().getTotalNumberOfMemorySegments());
-
-			// others components are still shut down
-			assertNull(env.getConnectionManager());
-			assertNull(env.getPartitionConsumableNotifier());
-			assertNull(env.getTaskEventDispatcher());
-			assertNull(env.getPartitionManager());
-
-			// associate the environment with some mock actors
-			env.associateWithTaskManagerAndJobManager(
-					DummyActorGateway.INSTANCE,
-					DummyActorGateway.INSTANCE);
-
-			assertNotNull(env.getConnectionManager());
-			assertNotNull(env.getPartitionConsumableNotifier());
-			assertNotNull(env.getTaskEventDispatcher());
-			assertNotNull(env.getPartitionManager());
-
-			// allocate some buffer pool
-			BufferPool localPool = env.getNetworkBufferPool().createBufferPool(10, false);
-			assertNotNull(localPool);
-
-			// disassociate
-			env.disassociate();
-
-			assertNull(env.getConnectionManager());
-			assertNull(env.getPartitionConsumableNotifier());
-			assertNull(env.getTaskEventDispatcher());
-			assertNull(env.getPartitionManager());
-
-			assertNotNull(env.getNetworkBufferPool());
-			assertTrue(localPool.isDestroyed());
-
-			// associate once again
-			env.associateWithTaskManagerAndJobManager(
-					DummyActorGateway.INSTANCE,
-					DummyActorGateway.INSTANCE
-			);
-
-			assertNotNull(env.getConnectionManager());
-			assertNotNull(env.getPartitionConsumableNotifier());
-			assertNotNull(env.getTaskEventDispatcher());
-			assertNotNull(env.getPartitionManager());
-
-			// shutdown for good
-			env.shutdown();
-
-			assertTrue(env.isShutdown());
-			assertFalse(env.isAssociated());
-			assertNull(env.getConnectionManager());
-			assertNull(env.getPartitionConsumableNotifier());
-			assertNull(env.getTaskEventDispatcher());
-			assertNull(env.getPartitionManager());
-		}
-		catch (Exception e) {
-			e.printStackTrace();
-			fail(e.getMessage());
-		}
+	@Parameterized.Parameters(name = "Credit-based = {0}")
+	public static List<Boolean> parameters() {
+		return Arrays.asList(Boolean.TRUE, Boolean.FALSE);
 	}
 
+	@Rule
+	public ExpectedException expectedException = ExpectedException.none();
 
 	/**
-	 * Registers a task with an eager and non-eager partition at the network
-	 * environment and verifies that there is exactly on schedule or update
-	 * message to the job manager for the eager partition.
+	 * Verifies that {@link NetworkEnvironment#registerTask(Task)} sets up (un)bounded buffer pool
+	 * instances for various types of input and output channels.
 	 */
 	@Test
-	@SuppressWarnings("unchecked")
-	public void testEagerlyDeployConsumers() throws Exception {
-		// Mock job manager => expected interactions will be verified
-		ActorGateway jobManager = mock(ActorGateway.class);
-		when(jobManager.ask(anyObject(), any(FiniteDuration.class)))
-				.thenReturn(new Promise.DefaultPromise<>().future());
+	public void testRegisterTaskUsesBoundedBuffers() throws Exception {
 
-		// Network environment setup
-		NetworkEnvironmentConfiguration config = new NetworkEnvironmentConfiguration(
-				20,
-				1024,
-				MemoryType.HEAP,
-				IOManager.IOMode.SYNC,
-				Some.<NettyConfig>empty(),
-				new Tuple2<>(0, 0));
+		final NetworkEnvironment network = new NetworkEnvironment(
+			new NetworkBufferPool(numBuffers, memorySegmentSize),
+			new LocalConnectionManager(),
+			new ResultPartitionManager(),
+			new TaskEventDispatcher(),
+			new KvStateRegistry(),
+			null,
+			null,
+			IOManager.IOMode.SYNC,
+			0,
+			0,
+			2,
+			8,
+			enableCreditBasedFlowControl);
 
-		NetworkEnvironment env = new NetworkEnvironment(
-				TestingUtils.defaultExecutionContext(),
-				new FiniteDuration(30, TimeUnit.SECONDS),
-				config);
+		// result partitions
+		ResultPartition rp1 = createResultPartition(ResultPartitionType.PIPELINED, 2);
+		ResultPartition rp2 = createResultPartition(ResultPartitionType.BLOCKING, 2);
+		ResultPartition rp3 = createResultPartition(ResultPartitionType.PIPELINED_BOUNDED, 2);
+		ResultPartition rp4 = createResultPartition(ResultPartitionType.PIPELINED_BOUNDED, 8);
+		final ResultPartition[] resultPartitions = new ResultPartition[] {rp1, rp2, rp3, rp4};
 
-		// Associate the environment with the mock actors
-		env.associateWithTaskManagerAndJobManager(
-				jobManager,
-				DummyActorGateway.INSTANCE);
+		// input gates
+		SingleInputGate ig1 = createSingleInputGate(ResultPartitionType.PIPELINED, 2);
+		SingleInputGate ig2 = createSingleInputGate(ResultPartitionType.BLOCKING, 2);
+		SingleInputGate ig3 = createSingleInputGate(ResultPartitionType.PIPELINED_BOUNDED, 2);
+		SingleInputGate ig4 = createSingleInputGate(ResultPartitionType.PIPELINED_BOUNDED, 8);
+		final SingleInputGate[] inputGates = new SingleInputGate[] {ig1, ig2, ig3, ig4};
 
-		// Register mock task
-		JobID jobId = new JobID();
+		// overall task to register
+		Task task = mock(Task.class);
+		when(task.getProducedPartitions()).thenReturn(resultPartitions);
+		when(task.getAllInputGates()).thenReturn(inputGates);
 
-		ResultPartition[] partitions = new ResultPartition[2];
-		partitions[0] = createPartition("p1", jobId, true, env);
-		partitions[1] = createPartition("p2", jobId, false, env);
+		network.registerTask(task);
 
-		ResultPartitionWriter[] writers = new ResultPartitionWriter[2];
-		writers[0] = new ResultPartitionWriter(partitions[0]);
-		writers[1] = new ResultPartitionWriter(partitions[1]);
+		// verify buffer pools for the result partitions
+		assertEquals(rp1.getNumberOfSubpartitions(), rp1.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(rp2.getNumberOfSubpartitions(), rp2.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(rp3.getNumberOfSubpartitions(), rp3.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(rp4.getNumberOfSubpartitions(), rp4.getBufferPool().getNumberOfRequiredMemorySegments());
 
-		Task mockTask = mock(Task.class);
-		when(mockTask.getAllInputGates()).thenReturn(new SingleInputGate[0]);
-		when(mockTask.getAllWriters()).thenReturn(writers);
-		when(mockTask.getProducedPartitions()).thenReturn(partitions);
+		assertEquals(Integer.MAX_VALUE, rp1.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(Integer.MAX_VALUE, rp2.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(2 * 2 + 8, rp3.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(8 * 2 + 8, rp4.getBufferPool().getMaxNumberOfMemorySegments());
 
-		env.registerTask(mockTask);
+		// verify buffer pools for the input gates (NOTE: credit-based uses minimum required buffers
+		// for exclusive buffers not managed by the buffer pool)
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig1.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig2.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig3.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 8, ig4.getBufferPool().getNumberOfRequiredMemorySegments());
 
-		// Verify
-		ResultPartitionID eagerPartitionId = partitions[0].getPartitionId();
+		assertEquals(Integer.MAX_VALUE, ig1.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(Integer.MAX_VALUE, ig2.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 8 : 2 * 2 + 8, ig3.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 8 : 8 * 2 + 8, ig4.getBufferPool().getMaxNumberOfMemorySegments());
 
-		verify(jobManager, times(1)).ask(
-				eq(new ScheduleOrUpdateConsumers(jobId, eagerPartitionId)),
-				any(FiniteDuration.class));
+		int invokations = enableCreditBasedFlowControl ? 1 : 0;
+		verify(ig1, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig2, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig3, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig4, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+
+		for (ResultPartition rp : resultPartitions) {
+			rp.release();
+		}
+		for (SingleInputGate ig : inputGates) {
+			ig.releaseAllResources();
+		}
+		network.shutdown();
 	}
 
 	/**
-	 * Helper to create a mock result partition.
+	 * Verifies that {@link NetworkEnvironment#registerTask(Task)} sets up (un)bounded buffer pool
+	 * instances for various types of input and output channels working with the bare minimum of
+	 * required buffers.
 	 */
-	private static ResultPartition createPartition(
-			String name,
-			JobID jobId,
-			boolean eagerlyDeployConsumers,
-			NetworkEnvironment env) {
+	@Test
+	public void testRegisterTaskWithLimitedBuffers() throws Exception {
+		final int bufferCount;
+		// outgoing: 1 buffer per channel (always)
+		if (!enableCreditBasedFlowControl) {
+			// incoming: 1 buffer per channel
+			bufferCount = 20;
+		} else {
+			// incoming: 2 exclusive buffers per channel
+			bufferCount = 10 + 10 * TaskManagerOptions.NETWORK_BUFFERS_PER_CHANNEL.defaultValue();
+		}
 
+		testRegisterTaskWithLimitedBuffers(bufferCount);
+	}
+
+	/**
+	 * Verifies that {@link NetworkEnvironment#registerTask(Task)} fails if the bare minimum of
+	 * required buffers is not available (we are one buffer short).
+	 */
+	@Test
+	public void testRegisterTaskWithInsufficientBuffers() throws Exception {
+		final int bufferCount;
+		// outgoing: 1 buffer per channel (always)
+		if (!enableCreditBasedFlowControl) {
+			// incoming: 1 buffer per channel
+			bufferCount = 19;
+		} else {
+			// incoming: 2 exclusive buffers per channel
+			bufferCount = 10 + 10 * TaskManagerOptions.NETWORK_BUFFERS_PER_CHANNEL.defaultValue() - 1;
+		}
+
+		expectedException.expect(IOException.class);
+		expectedException.expectMessage("Insufficient number of network buffers");
+		testRegisterTaskWithLimitedBuffers(bufferCount);
+	}
+
+	private void testRegisterTaskWithLimitedBuffers(int bufferPoolSize) throws Exception {
+		final NetworkEnvironment network = new NetworkEnvironment(
+			new NetworkBufferPool(bufferPoolSize, memorySegmentSize),
+			new LocalConnectionManager(),
+			new ResultPartitionManager(),
+			new TaskEventDispatcher(),
+			new KvStateRegistry(),
+			null,
+			null,
+			IOManager.IOMode.SYNC,
+			0,
+			0,
+			2,
+			8,
+			enableCreditBasedFlowControl);
+
+		final ConnectionManager connManager = createDummyConnectionManager();
+
+		// result partitions
+		ResultPartition rp1 = createResultPartition(ResultPartitionType.PIPELINED, 2);
+		ResultPartition rp2 = createResultPartition(ResultPartitionType.BLOCKING, 2);
+		ResultPartition rp3 = createResultPartition(ResultPartitionType.PIPELINED_BOUNDED, 2);
+		ResultPartition rp4 = createResultPartition(ResultPartitionType.PIPELINED_BOUNDED, 4);
+		final ResultPartition[] resultPartitions = new ResultPartition[] {rp1, rp2, rp3, rp4};
+
+		// input gates
+		SingleInputGate ig1 = createSingleInputGate(ResultPartitionType.PIPELINED, 2);
+		SingleInputGate ig2 = createSingleInputGate(ResultPartitionType.BLOCKING, 2);
+		SingleInputGate ig3 = createSingleInputGate(ResultPartitionType.PIPELINED_BOUNDED, 2);
+		SingleInputGate ig4 = createSingleInputGate(ResultPartitionType.PIPELINED_BOUNDED, 4);
+		final SingleInputGate[] inputGates = new SingleInputGate[] {ig1, ig2, ig3, ig4};
+
+		// set up remote input channels for the exclusive buffers of the credit-based flow control
+		// (note that this does not obey the partition types which is ok for the scope of the test)
+		if (enableCreditBasedFlowControl) {
+			createRemoteInputChannel(ig4, 0, rp1, connManager);
+			createRemoteInputChannel(ig4, 0, rp2, connManager);
+			createRemoteInputChannel(ig4, 0, rp3, connManager);
+			createRemoteInputChannel(ig4, 0, rp4, connManager);
+
+			createRemoteInputChannel(ig1, 1, rp1, connManager);
+			createRemoteInputChannel(ig1, 1, rp4, connManager);
+
+			createRemoteInputChannel(ig2, 1, rp2, connManager);
+			createRemoteInputChannel(ig2, 2, rp4, connManager);
+
+			createRemoteInputChannel(ig3, 1, rp3, connManager);
+			createRemoteInputChannel(ig3, 3, rp4, connManager);
+		}
+
+		// overall task to register
+		Task task = mock(Task.class);
+		when(task.getProducedPartitions()).thenReturn(resultPartitions);
+		when(task.getAllInputGates()).thenReturn(inputGates);
+
+		network.registerTask(task);
+
+		// verify buffer pools for the result partitions
+		assertEquals(Integer.MAX_VALUE, rp1.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(Integer.MAX_VALUE, rp2.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(2 * 2 + 8, rp3.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(4 * 2 + 8, rp4.getBufferPool().getMaxNumberOfMemorySegments());
+
+		for (ResultPartition rp : resultPartitions) {
+			assertEquals(rp.getNumberOfSubpartitions(), rp.getBufferPool().getNumberOfRequiredMemorySegments());
+			assertEquals(rp.getNumberOfSubpartitions(), rp.getBufferPool().getNumBuffers());
+		}
+
+		// verify buffer pools for the input gates (NOTE: credit-based uses minimum required buffers
+		// for exclusive buffers not managed by the buffer pool)
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig1.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig2.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 2, ig3.getBufferPool().getNumberOfRequiredMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 0 : 4, ig4.getBufferPool().getNumberOfRequiredMemorySegments());
+
+		assertEquals(Integer.MAX_VALUE, ig1.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(Integer.MAX_VALUE, ig2.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 8 : 2 * 2 + 8, ig3.getBufferPool().getMaxNumberOfMemorySegments());
+		assertEquals(enableCreditBasedFlowControl ? 8 : 4 * 2 + 8, ig4.getBufferPool().getMaxNumberOfMemorySegments());
+
+		int invokations = enableCreditBasedFlowControl ? 1 : 0;
+		verify(ig1, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig2, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig3, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+		verify(ig4, times(invokations)).assignExclusiveSegments(network.getNetworkBufferPool(), 2);
+
+		for (ResultPartition rp : resultPartitions) {
+			rp.release();
+		}
+		for (SingleInputGate ig : inputGates) {
+			ig.releaseAllResources();
+		}
+		network.shutdown();
+	}
+
+	/**
+	 * Helper to create simple {@link ResultPartition} instance for use by a {@link Task} inside
+	 * {@link NetworkEnvironment#registerTask(Task)}.
+	 *
+	 * @param partitionType
+	 * 		the produced partition type
+	 * @param channels
+	 * 		the number of output channels
+	 *
+	 * @return instance with minimal data set and some mocks so that it is useful for {@link
+	 * NetworkEnvironment#registerTask(Task)}
+	 */
+	private static ResultPartition createResultPartition(
+			final ResultPartitionType partitionType, final int channels) {
 		return new ResultPartition(
-				name,
-				jobId,
-				new ResultPartitionID(),
-				ResultPartitionType.PIPELINED,
-				eagerlyDeployConsumers,
-				1,
-				env.getPartitionManager(),
-				env.getPartitionConsumableNotifier(),
-				mock(IOManager.class),
-				env.getDefaultIOMode());
+			"TestTask-" + partitionType + ":" + channels,
+			mock(TaskActions.class),
+			new JobID(),
+			new ResultPartitionID(),
+			partitionType,
+			channels,
+			channels,
+			mock(ResultPartitionManager.class),
+			mock(ResultPartitionConsumableNotifier.class),
+			mock(IOManager.class),
+			false);
+	}
+
+	/**
+	 * Helper to create spy of a {@link SingleInputGate} for use by a {@link Task} inside
+	 * {@link NetworkEnvironment#registerTask(Task)}.
+	 *
+	 * @param partitionType
+	 * 		the consumed partition type
+	 * @param channels
+	 * 		the number of input channels
+	 *
+	 * @return input gate with some fake settings
+	 */
+	private SingleInputGate createSingleInputGate(
+			final ResultPartitionType partitionType, final int channels) {
+		return spy(new SingleInputGate(
+			"Test Task Name",
+			new JobID(),
+			new IntermediateDataSetID(),
+			partitionType,
+			0,
+			channels,
+			mock(TaskActions.class),
+			UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup(),
+			enableCreditBasedFlowControl));
+	}
+
+	private static void createRemoteInputChannel(
+			SingleInputGate inputGate,
+			int channelIndex,
+			ResultPartition resultPartition,
+			ConnectionManager connManager) {
+		RemoteInputChannel channel = new RemoteInputChannel(
+			inputGate,
+			channelIndex,
+			resultPartition.getPartitionId(),
+			mock(ConnectionID.class),
+			connManager,
+			0,
+			0,
+			UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup());
+		inputGate.setInputChannel(resultPartition.getPartitionId().getPartitionId(), channel);
 	}
 }

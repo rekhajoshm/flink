@@ -19,8 +19,6 @@
 package org.apache.flink.runtime.io.network.api.reader;
 
 import org.apache.flink.core.io.IOReadableWritable;
-import org.apache.flink.metrics.groups.IOMetricGroup;
-import org.apache.flink.runtime.accumulators.AccumulatorRegistry;
 import org.apache.flink.runtime.io.network.api.serialization.RecordDeserializer;
 import org.apache.flink.runtime.io.network.api.serialization.RecordDeserializer.DeserializationResult;
 import org.apache.flink.runtime.io.network.api.serialization.SpillingAdaptiveSpanningRecordDeserializer;
@@ -32,8 +30,8 @@ import java.io.IOException;
 
 /**
  * A record-oriented reader.
- * <p>
- * This abstract base class is used by both the mutable and immutable record readers.
+ *
+ * <p>This abstract base class is used by both the mutable and immutable record readers.
  *
  * @param <T> The type of the record that can be read with this record reader.
  */
@@ -76,7 +74,7 @@ abstract class AbstractRecordReader<T extends IOReadableWritable> extends Abstra
 				if (result.isBufferConsumed()) {
 					final Buffer currentBuffer = currentRecordDeserializer.getCurrentBuffer();
 
-					currentBuffer.recycle();
+					currentBuffer.recycleBuffer();
 					currentRecordDeserializer = null;
 				}
 
@@ -85,7 +83,7 @@ abstract class AbstractRecordReader<T extends IOReadableWritable> extends Abstra
 				}
 			}
 
-			final BufferOrEvent bufferOrEvent = inputGate.getNextBufferOrEvent();
+			final BufferOrEvent bufferOrEvent = inputGate.getNextBufferOrEvent().orElseThrow(IllegalStateException::new);
 
 			if (bufferOrEvent.isBuffer()) {
 				currentRecordDeserializer = recordDeserializers[bufferOrEvent.getChannelIndex()];
@@ -120,22 +118,9 @@ abstract class AbstractRecordReader<T extends IOReadableWritable> extends Abstra
 		for (RecordDeserializer<?> deserializer : recordDeserializers) {
 			Buffer buffer = deserializer.getCurrentBuffer();
 			if (buffer != null && !buffer.isRecycled()) {
-				buffer.recycle();
+				buffer.recycleBuffer();
 			}
-		}
-	}
-
-	@Override
-	public void setReporter(AccumulatorRegistry.Reporter reporter) {
-		for (RecordDeserializer<?> deserializer : recordDeserializers) {
-			deserializer.setReporter(reporter);
-		}
-	}
-	
-	@Override
-	public void setMetricGroup(IOMetricGroup metrics) {
-		for (RecordDeserializer<?> deserializer : recordDeserializers) {
-			deserializer.instantiateMetrics(metrics);
+			deserializer.clear();
 		}
 	}
 }

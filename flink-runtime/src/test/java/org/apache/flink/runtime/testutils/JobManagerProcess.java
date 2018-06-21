@@ -23,23 +23,25 @@ import akka.actor.ActorSystem;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
 import org.apache.flink.runtime.jobmanager.JobManager;
 import org.apache.flink.runtime.jobmanager.JobManagerMode;
+import org.apache.flink.runtime.jobmaster.JobMaster;
+import org.apache.flink.runtime.rpc.akka.AkkaRpcServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import scala.Option;
 import scala.concurrent.duration.Deadline;
 import scala.concurrent.duration.FiniteDuration;
 
-import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * A {@link JobManager} instance running in a separate JVM.
@@ -143,12 +145,15 @@ public class JobManagerProcess extends TestJvmProcess {
 	/**
 	 * Returns the Akka URL of this JobManager.
 	 */
-	public String getJobManagerAkkaURL(FiniteDuration timeout) throws InterruptedException {
+	public String getJobManagerAkkaURL(FiniteDuration timeout) throws InterruptedException, UnknownHostException {
 		int port = getJobManagerPort(timeout);
 
-		return JobManager.getRemoteJobManagerAkkaURL(
-				new InetSocketAddress("localhost", port),
-				Option.<String>empty());
+		return AkkaRpcServiceUtils.getRpcUrl(
+			"localhost",
+			port,
+			JobMaster.JOB_MANAGER_NAME,
+			HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION,
+			config);
 	}
 
 	@Override
@@ -212,7 +217,7 @@ public class JobManagerProcess extends TestJvmProcess {
 		 * <code>--port PORT</code>.
 		 *
 		 * <p>Other arguments are parsed to a {@link Configuration} and passed to the
-		 * JobManager, for instance: <code>--recovery.mode ZOOKEEPER --recovery.zookeeper.quorum
+		 * JobManager, for instance: <code>--high-availability ZOOKEEPER --high-availability.zookeeper.quorum
 		 * "xyz:123:456"</code>.
 		 */
 		public static void main(String[] args) {

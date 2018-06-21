@@ -18,19 +18,28 @@
 
 package org.apache.flink.runtime.testingUtils
 
+import java.io.DataInputStream
+import java.util.function.BiFunction
+
 import akka.actor.{ActorRef, Cancellable, Terminated}
 import akka.pattern.{ask, pipe}
 import org.apache.flink.api.common.JobID
+import org.apache.flink.core.fs.FSDataInputStream
 import org.apache.flink.runtime.FlinkActor
-import org.apache.flink.runtime.clusterframework.messages.RegisterResourceSuccessful
+import org.apache.flink.runtime.checkpoint.savepoint.Savepoint
+import org.apache.flink.runtime.checkpoint._
 import org.apache.flink.runtime.execution.ExecutionState
 import org.apache.flink.runtime.jobgraph.JobStatus
 import org.apache.flink.runtime.jobmanager.JobManager
+import org.apache.flink.runtime.jobmanager.slots.ActorTaskManagerGateway
+import org.apache.flink.runtime.messages.Acknowledge
 import org.apache.flink.runtime.messages.ExecutionGraphMessages.JobStatusChanged
-import org.apache.flink.runtime.messages.JobManagerMessages.GrantLeadership
-import org.apache.flink.runtime.messages.Messages.{Acknowledge, Disconnect}
+import org.apache.flink.runtime.messages.JobManagerMessages._
+import org.apache.flink.runtime.messages.Messages.Disconnect
 import org.apache.flink.runtime.messages.RegistrationMessages.RegisterTaskManager
 import org.apache.flink.runtime.messages.TaskManagerMessages.Heartbeat
+import org.apache.flink.runtime.state.memory.MemoryStateBackend
+import org.apache.flink.runtime.state.{StateBackend, StateBackendLoader, StreamStateHandle}
 import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages._
 import org.apache.flink.runtime.testingUtils.TestingMessages._
 import org.apache.flink.runtime.testingUtils.TestingTaskManagerMessages.AccumulatorsChanged
@@ -38,14 +47,15 @@ import org.apache.flink.runtime.testingUtils.TestingTaskManagerMessages.Accumula
 import scala.collection.mutable
 import scala.concurrent.Future
 import scala.concurrent.duration._
-import language.postfixOps
+import scala.language.postfixOps
 
 /** This mixin can be used to decorate a JobManager with messages for testing purpose.  */
 trait TestingJobManagerLike extends FlinkActor {
   that: JobManager =>
 
-  import scala.collection.JavaConverters._
   import context._
+
+  import scala.collection.JavaConverters._
 
   val waitForAllVerticesToBeRunning = scala.collection.mutable.HashMap[JobID, Set[ActorRef]]()
   val waitForTaskManagerToBeTerminated = scala.collection.mutable.HashMap[String, Set[ActorRef]]()
@@ -66,6 +76,8 @@ trait TestingJobManagerLike extends FlinkActor {
     new Ordering[(Int, ActorRef)] {
       override def compare(x: (Int, ActorRef), y: (Int, ActorRef)): Int = y._1 - x._1
     })
+
+  val waitForClient = scala.collection.mutable.HashSet[ActorRef]()
 
   val waitForShutdown = scala.collection.mutable.HashSet[ActorRef]()
 
@@ -88,7 +100,7 @@ trait TestingJobManagerLike extends FlinkActor {
   }
 
   def handleTestingMessage: Receive = {
-    case Alive => sender() ! Acknowledge
+    case Alive => sender() ! Acknowledge.get()
 
     case RequestExecutionGraph(jobID) =>
       currentJobs.get(jobID) match {
@@ -152,10 +164,16 @@ trait TestingJobManagerLike extends FlinkActor {
 
 
     case NotifyWhenJobRemoved(jobID) =>
-      val gateways = instanceManager.getAllRegisteredInstances.asScala.map(_.getActorGateway)
+      val gateways = instanceManager.getAllRegisteredInstances.asScala.map(_.getTaskManagerGateway)
 
       val responses = gateways.map{
-        gateway => gateway.ask(NotifyWhenJobRemoved(jobID), timeout).mapTo[Boolean]
+        gateway =>  gateway match {
+          case actorGateway: ActorTaskManagerGateway =>
+            actorGateway.getActorGateway.ask(NotifyWhenJobRemoved(jobID), timeout).mapTo[Boolean]
+          case _ =>
+            throw new IllegalStateException("The task manager gateway is not of type " +
+                                             s"${classOf[ActorTaskManagerGateway].getSimpleName}")
+        }
       }
 
       val jobRemovedOnJobManager = (self ? CheckIfJobRemoved(jobID))(timeout).mapTo[Boolean]
@@ -223,10 +241,9 @@ trait TestingJobManagerLike extends FlinkActor {
         case (jobID, (updated, actors)) if updated =>
           currentJobs.get(jobID) match {
             case Some((graph, jobInfo)) =>
-              val flinkAccumulators = graph.getFlinkAccumulators
               val userAccumulators = graph.aggregateUserAccumulators
               actors foreach {
-                actor => actor ! UpdatedAccumulators(jobID, flinkAccumulators, userAccumulators)
+                 actor => actor ! UpdatedAccumulators(jobID, userAccumulators)
               }
             case None =>
           }
@@ -247,7 +264,15 @@ trait TestingJobManagerLike extends FlinkActor {
             } else {
               sender ! decorateMessage(
                 WorkingTaskManager(
-                  Some(resource.getInstance().getActorGateway)
+                  Some(
+                    resource.getTaskManagerGateway() match {
+                      case actorTaskManagerGateway: ActorTaskManagerGateway =>
+                        actorTaskManagerGateway.getActorGateway
+                      case _ => throw new IllegalStateException(
+                        "The task manager gateway is not of type " +
+                          s"${classOf[ActorTaskManagerGateway].getSimpleName}")
+                    }
+                  )
                 )
               )
             }
@@ -292,7 +317,22 @@ trait TestingJobManagerLike extends FlinkActor {
 
     case RequestSavepoint(savepointPath) =>
       try {
-        val savepoint = savepointStore.getState(savepointPath)
+        val classloader = Thread.currentThread().getContextClassLoader
+
+        val loadedBackend = StateBackendLoader.loadStateBackendFromConfig(
+          flinkConfiguration, classloader, null)
+        val backend = if (loadedBackend != null) loadedBackend else new MemoryStateBackend()
+
+        val checkpointLocation = backend.resolveCheckpoint(savepointPath)
+
+        val stream = new DataInputStream(checkpointLocation.getMetadataHandle.openInputStream())
+        val savepoint = try {
+          Checkpoints.loadCheckpointMetadata(stream, classloader)
+        }
+        finally {
+          stream.close()
+        }
+
         sender ! ResponseSavepoint(savepoint)
       }
       catch {
@@ -314,8 +354,62 @@ trait TestingJobManagerLike extends FlinkActor {
         }
       }
 
+    case CheckpointRequest(jobId, retentionPolicy) =>
+      currentJobs.get(jobId) match {
+        case Some((graph, _)) =>
+          val checkpointCoordinator = graph.getCheckpointCoordinator()
+
+          if (checkpointCoordinator != null) {
+            // Immutable copy for the future
+            val senderRef = sender()
+            try {
+              // Do this async, because checkpoint coordinator operations can
+              // contain blocking calls to the state backend or ZooKeeper.
+              val triggerResult = checkpointCoordinator.triggerCheckpoint(
+                System.currentTimeMillis(),
+                CheckpointProperties.forCheckpoint(retentionPolicy),
+                null,
+                false)
+
+              if (triggerResult.isSuccess) {
+                triggerResult.getPendingCheckpoint.getCompletionFuture.handleAsync[Void](
+                  new BiFunction[CompletedCheckpoint, Throwable, Void] {
+                    override def apply(success: CompletedCheckpoint, cause: Throwable): Void = {
+                      if (success != null) {
+                        senderRef ! CheckpointRequestSuccess(
+                          jobId,
+                          success.getCheckpointID,
+                          success.getExternalPointer,
+                          success.getTimestamp)
+                      } else {
+                        senderRef ! CheckpointRequestFailure(
+                          jobId, new Exception("Failed to complete checkpoint", cause))
+                      }
+                      null
+                    }
+                  },
+                  context.dispatcher)
+              } else {
+                senderRef ! CheckpointRequestFailure(jobId, new Exception(
+                  "Failed to trigger checkpoint: " +  triggerResult.getFailureReason.message()))
+              }
+            } catch {
+              case e: Exception =>
+                senderRef ! CheckpointRequestFailure(jobId, new Exception(
+                  "Failed to trigger checkpoint", e))
+            }
+          } else {
+            sender() ! CheckpointRequestFailure(jobId, new IllegalStateException(
+              "Checkpointing disabled. You can enable it via the execution environment of " +
+                "your job."))
+          }
+
+        case None =>
+          sender() ! CheckpointRequestFailure(jobId, new IllegalArgumentException("Unknown job."))
+      }
+
     case NotifyWhenLeader =>
-      if (leaderElectionService.hasLeadership) {
+      if (leaderSessionID.isDefined && leaderElectionService.hasLeadership(leaderSessionID.get)) {
         sender() ! true
       } else {
         waitForLeader += sender()
@@ -328,26 +422,37 @@ trait TestingJobManagerLike extends FlinkActor {
 
       waitForLeader.clear()
 
+    case NotifyWhenClientConnects =>
+      waitForClient += sender()
+      sender() ! true
+
+    case msg: RegisterJobClient =>
+      super.handleMessage(msg)
+      waitForClient.foreach(_ ! ClientConnected)
+    case msg: RequestClassloadingProps =>
+      super.handleMessage(msg)
+      waitForClient.foreach(_ ! ClassLoadingPropsDelivered)
+
     case NotifyWhenAtLeastNumTaskManagerAreRegistered(numRegisteredTaskManager) =>
       if (that.instanceManager.getNumberOfRegisteredTaskManagers >= numRegisteredTaskManager) {
         // there are already at least numRegisteredTaskManager registered --> send Acknowledge
-        sender() ! Acknowledge
+        sender() ! Acknowledge.get()
       } else {
         // wait until we see at least numRegisteredTaskManager being registered at the JobManager
         waitForNumRegisteredTaskManagers += ((numRegisteredTaskManager, sender()))
       }
 
     // TaskManager may be registered on these two messages
-    case msg @ (_: RegisterTaskManager | _: RegisterResourceSuccessful) =>
+    case msg @ (_: RegisterTaskManager) =>
       super.handleMessage(msg)
 
-      // dequeue all senders which wait for instanceManager.getNumberOfRegisteredTaskManagers or
+      // dequeue all senders which wait for instanceManager.getNumberOfStartedTaskManagers or
       // fewer registered TaskManagers
       while (waitForNumRegisteredTaskManagers.nonEmpty &&
         waitForNumRegisteredTaskManagers.head._1 <=
           instanceManager.getNumberOfRegisteredTaskManagers) {
         val receiver = waitForNumRegisteredTaskManagers.dequeue()._2
-        receiver ! Acknowledge
+        receiver ! Acknowledge.get()
       }
   }
 

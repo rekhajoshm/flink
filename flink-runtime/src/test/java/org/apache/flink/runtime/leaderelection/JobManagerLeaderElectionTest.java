@@ -18,6 +18,31 @@
 
 package org.apache.flink.runtime.leaderelection;
 
+import org.apache.flink.configuration.BlobServerOptions;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.akka.AkkaUtils;
+import org.apache.flink.runtime.blob.BlobServer;
+import org.apache.flink.runtime.blob.VoidBlobStore;
+import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
+import org.apache.flink.runtime.checkpoint.StandaloneCheckpointRecoveryFactory;
+import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager;
+import org.apache.flink.runtime.execution.librarycache.FlinkUserCodeClassLoaders;
+import org.apache.flink.runtime.executiongraph.restart.NoRestartStrategy;
+import org.apache.flink.runtime.instance.InstanceManager;
+import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
+import org.apache.flink.runtime.jobmanager.StandaloneSubmittedJobGraphStore;
+import org.apache.flink.runtime.jobmanager.SubmittedJobGraphStore;
+import org.apache.flink.runtime.jobmanager.scheduler.Scheduler;
+import org.apache.flink.runtime.metrics.NoOpMetricRegistry;
+import org.apache.flink.runtime.metrics.groups.JobManagerMetricGroup;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
+import org.apache.flink.runtime.testingUtils.TestingJobManager;
+import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages;
+import org.apache.flink.runtime.testingUtils.TestingUtils;
+import org.apache.flink.runtime.testutils.ZooKeeperTestUtils;
+import org.apache.flink.runtime.util.ZooKeeperUtils;
+import org.apache.flink.util.TestLogger;
+
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 import akka.actor.PoisonPill;
@@ -27,38 +52,18 @@ import akka.testkit.JavaTestKit;
 import akka.util.Timeout;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.test.TestingServer;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.akka.AkkaUtils;
-import org.apache.flink.runtime.blob.BlobServer;
-import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
-import org.apache.flink.runtime.checkpoint.SavepointStore;
-import org.apache.flink.runtime.checkpoint.SavepointStoreFactory;
-import org.apache.flink.runtime.checkpoint.StandaloneCheckpointRecoveryFactory;
-import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager;
-import org.apache.flink.runtime.executiongraph.restart.NoRestartStrategy;
-import org.apache.flink.runtime.instance.InstanceManager;
-import org.apache.flink.runtime.jobmanager.RecoveryMode;
-import org.apache.flink.runtime.jobmanager.StandaloneSubmittedJobGraphStore;
-import org.apache.flink.runtime.jobmanager.SubmittedJobGraphStore;
-import org.apache.flink.runtime.jobmanager.scheduler.Scheduler;
-import org.apache.flink.runtime.testingUtils.TestingJobManager;
-import org.apache.flink.runtime.testingUtils.TestingJobManagerMessages;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
-import org.apache.flink.runtime.testutils.ZooKeeperTestUtils;
-import org.apache.flink.runtime.util.ZooKeeperUtils;
-import org.apache.flink.util.TestLogger;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+
+import java.util.concurrent.TimeUnit;
+
+import scala.Option;
 import scala.concurrent.Await;
 import scala.concurrent.Future;
 import scala.concurrent.duration.FiniteDuration;
-import scala.concurrent.forkjoin.ForkJoinPool;
-
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
 
 public class JobManagerLeaderElectionTest extends TestLogger {
 
@@ -67,8 +72,7 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 
 	private static ActorSystem actorSystem;
 	private static TestingServer testingServer;
-	private static ExecutorService executor;
-	
+
 	private static Timeout timeout = new Timeout(TestingUtils.TESTING_DURATION());
 	private static FiniteDuration duration = new FiniteDuration(5, TimeUnit.MINUTES);
 
@@ -76,7 +80,6 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 	public static void setup() throws Exception {
 		actorSystem = ActorSystem.create("TestingActorSystem");
 		testingServer = new TestingServer();
-		executor = new ForkJoinPool();
 	}
 
 	@AfterClass
@@ -88,10 +91,6 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 		if (testingServer != null) {
 			testingServer.stop();
 		}
-		
-		if (executor != null) {
-			executor.shutdownNow();
-		}
 	}
 
 	/**
@@ -100,7 +99,7 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 	@Test
 	public void testLeaderElection() throws Exception {
 		final Configuration configuration = ZooKeeperTestUtils
-			.createZooKeeperRecoveryModeConfig(
+			.createZooKeeperHAConfig(
 				testingServer.getConnectString(),
 				tempFolder.getRoot().getPath());
 
@@ -129,7 +128,7 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 	@Test
 	public void testLeaderReelection() throws Exception {
 		final Configuration configuration = ZooKeeperTestUtils
-			.createZooKeeperRecoveryModeConfig(
+			.createZooKeeperHAConfig(
 				testingServer.getConnectString(),
 				tempFolder.getRoot().getPath());
 
@@ -170,7 +169,7 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 
 	private Props createJobManagerProps(Configuration configuration) throws Exception {
 		LeaderElectionService leaderElectionService;
-		if (RecoveryMode.fromConfig(configuration) == RecoveryMode.STANDALONE) {
+		if (HighAvailabilityMode.fromConfig(configuration) == HighAvailabilityMode.NONE) {
 			leaderElectionService = new StandaloneLeaderElectionService();
 		}
 		else {
@@ -182,23 +181,28 @@ public class JobManagerLeaderElectionTest extends TestLogger {
 		// We don't need recovery in this test
 		SubmittedJobGraphStore submittedJobGraphStore = new StandaloneSubmittedJobGraphStore();
 		CheckpointRecoveryFactory checkpointRecoveryFactory = new StandaloneCheckpointRecoveryFactory();
-		SavepointStore savepointStore = SavepointStoreFactory.createFromConfig(configuration);
 
+		configuration.setLong(BlobServerOptions.CLEANUP_INTERVAL, 1L);
+
+		BlobServer blobServer = new BlobServer(configuration, new VoidBlobStore());
+		blobServer.start();
 		return Props.create(
-				TestingJobManager.class,
-				configuration,
-				executor,
-				new InstanceManager(),
-				new Scheduler(TestingUtils.defaultExecutionContext()),
-				new BlobLibraryCacheManager(new BlobServer(configuration), 10L),
-				ActorRef.noSender(),
-				new NoRestartStrategy.NoRestartStrategyFactory(),
-				AkkaUtils.getDefaultTimeout(),
-				leaderElectionService,
-				submittedJobGraphStore,
-				checkpointRecoveryFactory,
-				savepointStore,
-				AkkaUtils.getDefaultTimeout()
-		);
+			TestingJobManager.class,
+			configuration,
+			TestingUtils.defaultExecutor(),
+			TestingUtils.defaultExecutor(),
+			new InstanceManager(),
+			new Scheduler(TestingUtils.defaultExecutionContext()),
+			blobServer,
+			new BlobLibraryCacheManager(blobServer, FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST, new String[0]),
+			ActorRef.noSender(),
+			new NoRestartStrategy.NoRestartStrategyFactory(),
+			AkkaUtils.getDefaultTimeoutAsFiniteDuration(),
+			leaderElectionService,
+			submittedJobGraphStore,
+			checkpointRecoveryFactory,
+			AkkaUtils.getDefaultTimeoutAsFiniteDuration(),
+			UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup(),
+			Option.<String>empty());
 	}
 }

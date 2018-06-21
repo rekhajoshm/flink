@@ -19,11 +19,13 @@
 package org.apache.flink.streaming.api.windowing.triggers;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.api.common.state.MergingState;
 import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.windowing.windows.Window;
 
 import java.io.Serializable;
@@ -34,7 +36,7 @@ import java.io.Serializable;
  *
  * <p>A pane is the bucket of elements that have the same key (assigned by the
  * {@link org.apache.flink.api.java.functions.KeySelector}) and same {@link Window}. An element can
- * be in multiple panes of it was assigned to multiple windows by the
+ * be in multiple panes if it was assigned to multiple windows by the
  * {@link org.apache.flink.streaming.api.windowing.assigners.WindowAssigner}. These panes all
  * have their own instance of the {@code Trigger}.
  *
@@ -51,7 +53,7 @@ import java.io.Serializable;
  */
 @PublicEvolving
 public abstract class Trigger<T, W extends Window> implements Serializable {
-	
+
 	private static final long serialVersionUID = -4104633972991191369L;
 
 	/**
@@ -68,6 +70,11 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 	/**
 	 * Called when a processing-time timer that was set using the trigger context fires.
 	 *
+	 * <p>Note: This method is not called in case the window does not contain any elements. Thus,
+	 * if you return {@code PURGE} from a trigger method and you expect to do cleanup in a future
+	 * invocation of a timer callback it might be wise to clean any state that you would clean
+	 * in the timer callback.
+	 *
 	 * @param time The timestamp at which the timer fired.
 	 * @param window The window for which the timer fired.
 	 * @param ctx A context object that can be used to register timer callbacks.
@@ -76,6 +83,11 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 
 	/**
 	 * Called when an event-time timer that was set using the trigger context fires.
+	 *
+	 * <p>Note: This method is not called in case the window does not contain any elements. Thus,
+	 * if you return {@code PURGE} from a trigger method and you expect to do cleanup in a future
+	 * invocation of a timer callback it might be wise to clean any state that you would clean
+	 * in the timer callback.
 	 *
 	 * @param time The timestamp at which the timer fired.
 	 * @param window The window for which the timer fired.
@@ -102,8 +114,8 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 	 * @param window The new window that results from the merge.
 	 * @param ctx A context object that can be used to register timer callbacks and access state.
 	 */
-	public TriggerResult onMerge(W window, OnMergeContext ctx) throws Exception {
-		throw new RuntimeException("This trigger does not support merging.");
+	public void onMerge(W window, OnMergeContext ctx) throws Exception {
+		throw new UnsupportedOperationException("This trigger does not support merging.");
 	}
 
 	/**
@@ -111,13 +123,11 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 	 * when a window is purged. Timers set using {@link TriggerContext#registerEventTimeTimer(long)}
 	 * and {@link TriggerContext#registerProcessingTimeTimer(long)} should be deleted here as
 	 * well as state acquired using {@link TriggerContext#getPartitionedState(StateDescriptor)}.
-	 * 
-	 * <p>By default, this method does nothing.
 	 */
-	public void clear(W window, TriggerContext ctx) throws Exception {}
+	public abstract void clear(W window, TriggerContext ctx) throws Exception;
 
 	// ------------------------------------------------------------------------
-	
+
 	/**
 	 * A context object that is given to {@link Trigger} methods to allow them to register timer
 	 * callbacks and deal with state.
@@ -125,10 +135,26 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 	public interface TriggerContext {
 
 		/**
+		 * Returns the current processing time.
+		 */
+		long getCurrentProcessingTime();
+
+		/**
+		 * Returns the metric group for this {@link Trigger}. This is the same metric
+		 * group that would be returned from {@link RuntimeContext#getMetricGroup()} in a user
+		 * function.
+		 *
+		 * <p>You must not call methods that create metric objects
+		 * (such as {@link MetricGroup#counter(int)} multiple times but instead call once
+		 * and store the metric object in a field.
+		 */
+		MetricGroup getMetricGroup();
+
+		/**
 		 * Returns the current watermark time.
 		 */
 		long getCurrentWatermark();
-	
+
 		/**
 		 * Register a system time callback. When the current system time passes the specified
 		 * time {@link Trigger#onProcessingTime(long, Window, TriggerContext)} is called with the time specified here.
@@ -136,7 +162,7 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 		 * @param time The time at which to invoke {@link Trigger#onProcessingTime(long, Window, TriggerContext)}
 		 */
 		void registerProcessingTimeTimer(long time);
-	
+
 		/**
 		 * Register an event-time callback. When the current watermark passes the specified
 		 * time {@link Trigger#onEventTime(long, Window, TriggerContext)} is called with the time specified here.
@@ -145,19 +171,19 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 		 * @see org.apache.flink.streaming.api.watermark.Watermark
 		 */
 		void registerEventTimeTimer(long time);
-	
+
 		/**
 		 * Delete the processing time trigger for the given time.
 		 */
 		void deleteProcessingTimeTimer(long time);
-	
+
 		/**
 		 * Delete the event-time trigger for the given time.
 		 */
 		void deleteEventTimeTimer(long time);
-	
+
 		/**
-		 * Retrieves an {@link State} object that can be used to interact with
+		 * Retrieves a {@link State} object that can be used to interact with
 		 * fault-tolerant state that is scoped to the window and key of the current
 		 * trigger invocation.
 		 *
@@ -169,7 +195,7 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 		 *                                       function (function is not part os a KeyedStream).
 		 */
 		<S extends State> S getPartitionedState(StateDescriptor<S, ?> stateDescriptor);
-	
+
 		/**
 		 * Retrieves a {@link ValueState} object that can be used to interact with
 		 * fault-tolerant state that is scoped to the window and key of the current
@@ -185,11 +211,12 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 		 * @return The partitioned state object.
 		 * @throws UnsupportedOperationException Thrown, if no partitioned state is available for the
 		 *                                       function (function is not part os a KeyedStream).
+		 * @deprecated Use {@link #getPartitionedState(StateDescriptor)}.
 		 */
 		@Deprecated
 		<S extends Serializable> ValueState<S> getKeyValueState(String name, Class<S> stateType, S defaultState);
-	
-	
+
+
 		/**
 		 * Retrieves a {@link ValueState} object that can be used to interact with
 		 * fault-tolerant state that is scoped to the window and key of the current
@@ -205,6 +232,7 @@ public abstract class Trigger<T, W extends Window> implements Serializable {
 		 * @return The partitioned state object.
 		 * @throws UnsupportedOperationException Thrown, if no partitioned state is available for the
 		 *                                       function (function is not part os a KeyedStream).
+		 * @deprecated Use {@link #getPartitionedState(StateDescriptor)}.
 		 */
 		@Deprecated
 		<S extends Serializable> ValueState<S> getKeyValueState(String name, TypeInformation<S> stateType, S defaultState);

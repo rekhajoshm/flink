@@ -18,17 +18,18 @@
 
 package org.apache.flink.yarn
 
-import org.apache.flink.runtime.clusterframework.messages.StopCluster
 import org.apache.flink.runtime.clusterframework.types.ResourceID
-import org.apache.flink.runtime.instance.InstanceConnectionInfo
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices
 import org.apache.flink.runtime.io.disk.iomanager.IOManager
 import org.apache.flink.runtime.io.network.NetworkEnvironment
-import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
 import org.apache.flink.runtime.memory.MemoryManager
-import org.apache.flink.runtime.taskmanager.{TaskManagerConfiguration, TaskManager}
-import org.apache.flink.runtime.util.ProcessShutDownThread
+import org.apache.flink.runtime.metrics.groups.TaskManagerMetricGroup
+import org.apache.flink.runtime.security.SecurityUtils
+import org.apache.flink.runtime.state.TaskExecutorLocalStateStoresManager
+import org.apache.flink.runtime.taskexecutor.TaskManagerConfiguration
+import org.apache.flink.runtime.taskmanager.{TaskManager, TaskManagerLocation}
 
-import scala.concurrent.duration._
+import grizzled.slf4j.Logger
 
 /** An extension of the TaskManager that listens for additional YARN related
   * messages.
@@ -36,34 +37,50 @@ import scala.concurrent.duration._
 class YarnTaskManager(
     config: TaskManagerConfiguration,
     resourceID: ResourceID,
-    connectionInfo: InstanceConnectionInfo,
+    taskManagerLocation: TaskManagerLocation,
     memoryManager: MemoryManager,
     ioManager: IOManager,
     network: NetworkEnvironment,
+    taskManagerLocalStateStoresManager: TaskExecutorLocalStateStoresManager,
     numberOfSlots: Int,
-    leaderRetrievalService: LeaderRetrievalService)
+    highAvailabilityServices: HighAvailabilityServices,
+    taskManagerMetricGroup: TaskManagerMetricGroup)
   extends TaskManager(
     config,
     resourceID,
-    connectionInfo,
+    taskManagerLocation,
     memoryManager,
     ioManager,
     network,
+    taskManagerLocalStateStoresManager,
     numberOfSlots,
-    leaderRetrievalService) {
+    highAvailabilityServices,
+    taskManagerMetricGroup) {
 
   override def handleMessage: Receive = {
     super.handleMessage
   }
 }
 
-  object YarnTaskManager {
-    /** Entry point (main method) to run the TaskManager on YARN.
-      *
-      * @param args The command line arguments.
-      */
-    def main(args: Array[String]): Unit = {
-      YarnTaskManagerRunner.runYarnTaskManager(args, classOf[YarnTaskManager])
+object YarnTaskManager {
+
+  val LOG = Logger(classOf[TaskManager])
+
+  /** Entry point (main method) to run the TaskManager on YARN.
+    *
+    * @param args The command line arguments.
+    */
+  def main(args: Array[String]): Unit = {
+    val tmRunner = YarnTaskManagerRunnerFactory.create(
+      args, classOf[YarnTaskManager], System.getenv())
+
+    try {
+      SecurityUtils.getInstalledContext.runSecured(tmRunner)
+    } catch {
+      case e: Exception =>
+        LOG.error("Exception occurred while launching Task Manager runner", e)
+        throw new RuntimeException(e)
     }
+  }
 
 }

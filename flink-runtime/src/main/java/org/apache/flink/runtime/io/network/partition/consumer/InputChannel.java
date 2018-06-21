@@ -18,18 +18,19 @@
 
 package org.apache.flink.runtime.io.network.partition.consumer;
 
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.runtime.event.TaskEvent;
 import org.apache.flink.runtime.execution.CancelTaskException;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.ResultSubpartitionView;
-import scala.Tuple2;
 
 import java.io.IOException;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * An input channel consumes a single {@link ResultSubpartitionView}.
@@ -61,6 +62,8 @@ public abstract class InputChannel {
 	/** The maximum backoff (in ms). */
 	private final int maxBackoff;
 
+	protected final Counter numBytesIn;
+
 	/** The current backoff (in ms) */
 	private int currentBackoff;
 
@@ -68,12 +71,14 @@ public abstract class InputChannel {
 			SingleInputGate inputGate,
 			int channelIndex,
 			ResultPartitionID partitionId,
-			Tuple2<Integer, Integer> initialAndMaxBackoff) {
+			int initialBackoff,
+			int maxBackoff,
+			Counter numBytesIn) {
 
 		checkArgument(channelIndex >= 0);
 
-		int initial = initialAndMaxBackoff._1();
-		int max = initialAndMaxBackoff._2();
+		int initial = initialBackoff;
+		int max = maxBackoff;
 
 		checkArgument(initial >= 0 && initial <= max);
 
@@ -84,6 +89,8 @@ public abstract class InputChannel {
 		this.initialBackoff = initial;
 		this.maxBackoff = max;
 		this.currentBackoff = initial == 0 ? -1 : 0;
+
+		this.numBytesIn = numBytesIn;
 	}
 
 	// ------------------------------------------------------------------------
@@ -94,11 +101,24 @@ public abstract class InputChannel {
 		return channelIndex;
 	}
 
+	public ResultPartitionID getPartitionId() {
+		return partitionId;
+	}
+
 	/**
-	 * Notifies the owning {@link SingleInputGate} about an available {@link Buffer} instance.
+	 * Notifies the owning {@link SingleInputGate} that this channel became non-empty.
+	 * 
+	 * <p>This is guaranteed to be called only when a Buffer was added to a previously
+	 * empty input channel. The notion of empty is atomically consistent with the flag
+	 * {@link BufferAndAvailability#moreAvailable()} when polling the next buffer
+	 * from this channel.
+	 * 
+	 * <p><b>Note:</b> When the input channel observes an exception, this
+	 * method is called regardless of whether the channel was empty before. That ensures
+	 * that the parent InputGate will always be notified about the exception.
 	 */
-	protected void notifyAvailableBuffer() {
-		inputGate.onAvailableBuffer(this);
+	protected void notifyChannelNonEmpty() {
+		inputGate.notifyChannelNonEmpty(this);
 	}
 
 	// ------------------------------------------------------------------------
@@ -115,9 +135,9 @@ public abstract class InputChannel {
 	abstract void requestSubpartition(int subpartitionIndex) throws IOException, InterruptedException;
 
 	/**
-	 * Returns the next buffer from the consumed subpartition.
+	 * Returns the next buffer from the consumed subpartition or {@code Optional.empty()} if there is no data to return.
 	 */
-	abstract Buffer getNextBuffer() throws IOException, InterruptedException;
+	abstract Optional<BufferAndAvailability> getNextBuffer() throws IOException, InterruptedException;
 
 	// ------------------------------------------------------------------------
 	// Task events
@@ -176,7 +196,7 @@ public abstract class InputChannel {
 	protected void setError(Throwable cause) {
 		if (this.cause.compareAndSet(null, checkNotNull(cause))) {
 			// Notify the input gate.
-			notifyAvailableBuffer();
+			notifyChannelNonEmpty();
 		}
 	}
 
@@ -218,5 +238,37 @@ public abstract class InputChannel {
 
 		// Reached maximum backoff
 		return false;
+	}
+
+	// ------------------------------------------------------------------------
+
+	/**
+	 * A combination of a {@link Buffer} and a flag indicating availability of further buffers,
+	 * and the backlog length indicating how many non-event buffers are available in the
+	 * subpartition.
+	 */
+	public static final class BufferAndAvailability {
+
+		private final Buffer buffer;
+		private final boolean moreAvailable;
+		private final int buffersInBacklog;
+
+		public BufferAndAvailability(Buffer buffer, boolean moreAvailable, int buffersInBacklog) {
+			this.buffer = checkNotNull(buffer);
+			this.moreAvailable = moreAvailable;
+			this.buffersInBacklog = buffersInBacklog;
+		}
+
+		public Buffer buffer() {
+			return buffer;
+		}
+
+		public boolean moreAvailable() {
+			return moreAvailable;
+		}
+
+		public int buffersInBacklog() {
+			return buffersInBacklog;
+		}
 	}
 }

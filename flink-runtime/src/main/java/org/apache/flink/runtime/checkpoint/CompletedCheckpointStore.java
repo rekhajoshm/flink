@@ -18,6 +18,8 @@
 
 package org.apache.flink.runtime.checkpoint;
 
+import org.apache.flink.runtime.jobgraph.JobStatus;
+
 import java.util.List;
 
 /**
@@ -37,8 +39,7 @@ public interface CompletedCheckpointStore {
 	 * Adds a {@link CompletedCheckpoint} instance to the list of completed checkpoints.
 	 *
 	 * <p>Only a bounded number of checkpoints is kept. When exceeding the maximum number of
-	 * retained checkpoints, the oldest one will be discarded via {@link
-	 * CompletedCheckpoint#discard(ClassLoader)}.
+	 * retained checkpoints, the oldest one will be discarded.
 	 */
 	void addCheckpoint(CompletedCheckpoint checkpoint) throws Exception;
 
@@ -49,10 +50,14 @@ public interface CompletedCheckpointStore {
 	CompletedCheckpoint getLatestCheckpoint() throws Exception;
 
 	/**
-	 * Discards all added {@link CompletedCheckpoint} instances via {@link
-	 * CompletedCheckpoint#discard(ClassLoader)}.
+	 * Shuts down the store.
+	 *
+	 * <p>The job status is forwarded and used to decide whether state should
+	 * actually be discarded or kept.
+	 *
+	 * @param jobStatus Job state on shut down
 	 */
-	void discardAllCheckpoints() throws Exception;
+	void shutdown(JobStatus jobStatus) throws Exception;
 
 	/**
 	 * Returns all {@link CompletedCheckpoint} instances.
@@ -66,4 +71,18 @@ public interface CompletedCheckpointStore {
 	 */
 	int getNumberOfRetainedCheckpoints();
 
+	/**
+	 * Returns the max number of retained checkpoints.
+	 */
+	int getMaxNumberOfRetainedCheckpoints();
+
+	/**
+	 * This method returns whether the completed checkpoint store requires checkpoints to be
+	 * externalized. Externalized checkpoints have their meta data persisted, which the checkpoint
+	 * store can exploit (for example by simply pointing the persisted metadata).
+	 * 
+	 * @return True, if the store requires that checkpoints are externalized before being added, false
+	 *         if the store stores the metadata itself.
+	 */
+	boolean requiresExternalizedCheckpoints();
 }

@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-angular.module('flinkApp', ['ui.router', 'angularMoment'])
+angular.module('flinkApp', ['ui.router', 'angularMoment', 'dndLists'])
 
 # --------------------------------------
 
@@ -30,8 +30,17 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
 
 .value 'flinkConfig', {
   jobServer: ''
-# jobServer: 'http://localhost:8081/'
+#  jobServer: 'http://localhost:8081/'
   "refresh-interval": 10000
+}
+
+# --------------------------------------
+
+.value 'watermarksConfig', {
+  # A value of (Java) Long.MIN_VALUE indicates that there is no watermark
+  # available. This is parsed by Javascript as this number. We have it as
+  # a constant here to compare available watermarks against.
+  noWatermark: -9223372036854776000
 }
 
 # --------------------------------------
@@ -45,7 +54,6 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
     $interval ->
       JobsService.listJobs()
     , flinkConfig["refresh-interval"]
-
 
 # --------------------------------------
 
@@ -107,12 +115,18 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
         templateUrl: "partials/jobs/job.plan.node-list.subtasks.html"
         controller: 'JobPlanSubtasksController'
 
-  .state "single-job.plan.taskmanagers",
-    url: "/taskmanagers"
+  .state "single-job.plan.metrics",
+    url: "/metrics"
     views:
       'node-details':
-        templateUrl: "partials/jobs/job.plan.node-list.taskmanagers.html"
-        controller: 'JobPlanTaskManagersController'
+        templateUrl: "partials/jobs/job.plan.node-list.metrics.html"
+        controller: 'JobPlanMetricsController'
+
+  .state "single-job.plan.watermarks",
+    url: "/watermarks"
+    views:
+      'node-details':
+        templateUrl: "partials/jobs/job.plan.node-list.watermarks.html"
 
   .state "single-job.plan.accumulators",
     url: "/accumulators"
@@ -123,10 +137,46 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
 
   .state "single-job.plan.checkpoints",
     url: "/checkpoints"
+    redirectTo: "single-job.plan.checkpoints.overview"
     views:
       'node-details':
         templateUrl: "partials/jobs/job.plan.node-list.checkpoints.html"
         controller: 'JobPlanCheckpointsController'
+
+  .state "single-job.plan.checkpoints.overview",
+    url: "/overview"
+    views:
+      'checkpoints-view':
+        templateUrl: "partials/jobs/job.plan.node.checkpoints.overview.html"
+        controller: 'JobPlanCheckpointsController'
+
+  .state "single-job.plan.checkpoints.summary",
+    url: "/summary"
+    views:
+      'checkpoints-view':
+        templateUrl: "partials/jobs/job.plan.node.checkpoints.summary.html"
+        controller: 'JobPlanCheckpointsController'
+
+  .state "single-job.plan.checkpoints.history",
+    url: "/history"
+    views:
+      'checkpoints-view':
+        templateUrl: "partials/jobs/job.plan.node.checkpoints.history.html"
+        controller: 'JobPlanCheckpointsController'
+
+  .state "single-job.plan.checkpoints.config",
+    url: "/config"
+    views:
+      'checkpoints-view':
+        templateUrl: "partials/jobs/job.plan.node.checkpoints.config.html"
+        controller: 'JobPlanCheckpointsController'
+
+  .state "single-job.plan.checkpoints.details",
+    url: "/details/{checkpointId}"
+    views:
+      'checkpoints-view':
+        templateUrl: "partials/jobs/job.plan.node.checkpoints.details.html"
+        controller: 'JobPlanCheckpointDetailsController'
 
   .state "single-job.plan.backpressure",
     url: "/backpressure"
@@ -155,13 +205,6 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
         templateUrl: "partials/jobs/job.exceptions.html"
         controller: 'JobExceptionsController'
 
-  .state "single-job.properties",
-    url: "/properties"
-    views:
-      details:
-        templateUrl: "partials/jobs/job.properties.html"
-        controller: 'JobPropertiesController'
-
   .state "single-job.config",
     url: "/config"
     views:
@@ -177,16 +220,17 @@ angular.module('flinkApp', ['ui.router', 'angularMoment'])
 
   .state "single-manager",
       url: "/taskmanager/{taskmanagerid}"
+      abstract: true
       views:
         main:
           templateUrl: "partials/taskmanager/taskmanager.html"
+          controller: 'SingleTaskManagerController'
 
   .state "single-manager.metrics",
     url: "/metrics"
     views:
       details:
         templateUrl: "partials/taskmanager/taskmanager.metrics.html"
-        controller: 'SingleTaskManagerController'
 
   .state "single-manager.stdout",
     url: "/stdout"

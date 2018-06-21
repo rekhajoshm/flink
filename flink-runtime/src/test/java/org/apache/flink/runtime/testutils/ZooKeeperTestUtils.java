@@ -18,12 +18,14 @@
 
 package org.apache.flink.runtime.testutils;
 
-import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.configuration.AkkaOptions;
+import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.jobmanager.RecoveryMode;
-import org.apache.flink.runtime.state.filesystem.FsStateBackendFactory;
+import org.apache.flink.configuration.HighAvailabilityOptions;
+import org.apache.flink.configuration.WebOptions;
+import org.apache.flink.runtime.jobmanager.HighAvailabilityMode;
 
-import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * ZooKeeper test utilities.
@@ -31,29 +33,29 @@ import static com.google.common.base.Preconditions.checkNotNull;
 public class ZooKeeperTestUtils {
 
 	/**
-	 * Creates a configuration to operate in {@link RecoveryMode#ZOOKEEPER}.
+	 * Creates a configuration to operate in {@link HighAvailabilityMode#ZOOKEEPER}.
 	 *
 	 * @param zooKeeperQuorum   ZooKeeper quorum to connect to
 	 * @param fsStateHandlePath Base path for file system state backend (for checkpoints and
 	 *                          recovery)
-	 * @return A new configuration to operate in {@link RecoveryMode#ZOOKEEPER}.
+	 * @return A new configuration to operate in {@link HighAvailabilityMode#ZOOKEEPER}.
 	 */
-	public static Configuration createZooKeeperRecoveryModeConfig(
+	public static Configuration createZooKeeperHAConfig(
 			String zooKeeperQuorum, String fsStateHandlePath) {
 
-		return setZooKeeperRecoveryMode(new Configuration(), zooKeeperQuorum, fsStateHandlePath);
+		return configureZooKeeperHA(new Configuration(), zooKeeperQuorum, fsStateHandlePath);
 	}
 
 	/**
-	 * Sets all necessary configuration keys to operate in {@link RecoveryMode#ZOOKEEPER}.
+	 * Sets all necessary configuration keys to operate in {@link HighAvailabilityMode#ZOOKEEPER}.
 	 *
 	 * @param config            Configuration to use
 	 * @param zooKeeperQuorum   ZooKeeper quorum to connect to
 	 * @param fsStateHandlePath Base path for file system state backend (for checkpoints and
 	 *                          recovery)
-	 * @return The modified configuration to operate in {@link RecoveryMode#ZOOKEEPER}.
+	 * @return The modified configuration to operate in {@link HighAvailabilityMode#ZOOKEEPER}.
 	 */
-	public static Configuration setZooKeeperRecoveryMode(
+	public static Configuration configureZooKeeperHA(
 			Configuration config,
 			String zooKeeperQuorum,
 			String fsStateHandlePath) {
@@ -63,11 +65,11 @@ public class ZooKeeperTestUtils {
 		checkNotNull(fsStateHandlePath, "File state handle backend path");
 
 		// Web frontend, you have been dismissed. Sorry.
-		config.setInteger(ConfigConstants.JOB_MANAGER_WEB_PORT_KEY, -1);
+		config.setInteger(WebOptions.PORT, -1);
 
 		// ZooKeeper recovery mode
-		config.setString(ConfigConstants.RECOVERY_MODE, "ZOOKEEPER");
-		config.setString(ConfigConstants.ZOOKEEPER_QUORUM_KEY, zooKeeperQuorum);
+		config.setString(HighAvailabilityOptions.HA_MODE, "ZOOKEEPER");
+		config.setString(HighAvailabilityOptions.HA_ZOOKEEPER_QUORUM, zooKeeperQuorum);
 
 		int connTimeout = 5000;
 		if (System.getenv().containsKey("CI")) {
@@ -75,20 +77,20 @@ public class ZooKeeperTestUtils {
 			connTimeout = 30000;
 		}
 
-		config.setInteger(ConfigConstants.ZOOKEEPER_CONNECTION_TIMEOUT, connTimeout);
-		config.setInteger(ConfigConstants.ZOOKEEPER_SESSION_TIMEOUT, connTimeout);
+		config.setInteger(HighAvailabilityOptions.ZOOKEEPER_CONNECTION_TIMEOUT, connTimeout);
+		config.setInteger(HighAvailabilityOptions.ZOOKEEPER_SESSION_TIMEOUT, connTimeout);
 
 		// File system state backend
-		config.setString(ConfigConstants.STATE_BACKEND, "FILESYSTEM");
-		config.setString(FsStateBackendFactory.CHECKPOINT_DIRECTORY_URI_CONF_KEY, fsStateHandlePath + "/checkpoints");
-		config.setString(ConfigConstants.ZOOKEEPER_RECOVERY_PATH, fsStateHandlePath + "/recovery");
+		config.setString(CheckpointingOptions.STATE_BACKEND, "FILESYSTEM");
+		config.setString(CheckpointingOptions.CHECKPOINTS_DIRECTORY, fsStateHandlePath + "/checkpoints");
+		config.setString(HighAvailabilityOptions.HA_STORAGE_PATH, fsStateHandlePath + "/recovery");
 
 		// Akka failure detection and execution retries
-		config.setString(ConfigConstants.AKKA_WATCH_HEARTBEAT_INTERVAL, "1000 ms");
-		config.setString(ConfigConstants.AKKA_WATCH_HEARTBEAT_PAUSE, "6 s");
-		config.setInteger(ConfigConstants.AKKA_WATCH_THRESHOLD, 9);
-		config.setString(ConfigConstants.AKKA_ASK_TIMEOUT, "100 s");
-		config.setString(ConfigConstants.RECOVERY_JOB_DELAY, "10 s");
+		config.setString(AkkaOptions.WATCH_HEARTBEAT_INTERVAL, "1000 ms");
+		config.setString(AkkaOptions.WATCH_HEARTBEAT_PAUSE, "6 s");
+		config.setInteger(AkkaOptions.WATCH_THRESHOLD, 9);
+		config.setString(AkkaOptions.ASK_TIMEOUT, "100 s");
+		config.setString(HighAvailabilityOptions.HA_JOB_DELAY, "10 s");
 
 		return config;
 	}

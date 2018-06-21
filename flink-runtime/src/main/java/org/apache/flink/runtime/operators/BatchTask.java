@@ -21,8 +21,8 @@ package org.apache.flink.runtime.operators;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.distributions.DataDistribution;
-import org.apache.flink.api.common.functions.GroupCombineFunction;
 import org.apache.flink.api.common.functions.Function;
+import org.apache.flink.api.common.functions.GroupCombineFunction;
 import org.apache.flink.api.common.functions.Partitioner;
 import org.apache.flink.api.common.functions.util.FunctionUtils;
 import org.apache.flink.api.common.typeutils.TypeComparator;
@@ -31,7 +31,6 @@ import org.apache.flink.api.common.typeutils.TypeSerializerFactory;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.IOReadableWritable;
 import org.apache.flink.metrics.MetricGroup;
-import org.apache.flink.runtime.accumulators.AccumulatorRegistry;
 import org.apache.flink.runtime.broadcast.BroadcastVariableMaterialization;
 import org.apache.flink.runtime.execution.CancelTaskException;
 import org.apache.flink.runtime.execution.Environment;
@@ -44,6 +43,7 @@ import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.io.network.partition.consumer.UnionInputGate;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.memory.MemoryManager;
+import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.operators.chaining.ChainedDriver;
 import org.apache.flink.runtime.operators.chaining.ExceptionInChainedStubException;
 import org.apache.flink.runtime.operators.resettable.SpillingResettableMutableObjectIterator;
@@ -79,7 +79,7 @@ import java.util.Map;
 public class BatchTask<S extends Function, OT> extends AbstractInvokable implements TaskContext<S, OT> {
 
 	protected static final Logger LOG = LoggerFactory.getLogger(BatchTask.class);
-	
+
 	// --------------------------------------------------------------------------------------------
 
 	/**
@@ -131,7 +131,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	protected int[] iterativeInputs;
 	
 	/**
-	 * The indices of the iterative broadcast inputs. Empty, if non of the inputs is iteratve. 
+	 * The indices of the iterative broadcast inputs. Empty, if non of the inputs is iterative.
 	 */
 	protected int[] iterativeBroadcastInputs;
 	
@@ -184,13 +184,13 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 
 	/**
 	 * Certain inputs may be excluded from resetting. For example, the initial partial solution
-	 * in an iteration head must not be reseted (it is read through the back channel), when all
-	 * others are reseted.
+	 * in an iteration head must not be reset (it is read through the back channel), when all
+	 * others are reset.
 	 */
 	private boolean[] excludeFromReset;
 
 	/**
-	 * Flag indicating for each input whether it is cached and can be reseted.
+	 * Flag indicating for each input whether it is cached and can be reset.
 	 */
 	private boolean[] inputIsCached;
 
@@ -213,7 +213,20 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	 * The accumulator map used in the RuntimeContext.
 	 */
 	protected Map<String, Accumulator<?,?>> accumulatorMap;
-	private MetricGroup metrics;
+	private OperatorMetricGroup metrics;
+
+	// --------------------------------------------------------------------------------------------
+	//                                  Constructor
+	// --------------------------------------------------------------------------------------------
+
+	/**
+	 * Create an Invokable task and set its environment.
+	 *
+	 * @param environment The environment assigned to this invokable.
+	 */
+	public BatchTask(Environment environment) {
+		super(environment);
+	}
 
 	// --------------------------------------------------------------------------------------------
 	//                                  Task Interface
@@ -242,6 +255,10 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 		String headName =  getEnvironment().getTaskInfo().getTaskName().split("->")[0].trim();
 		this.metrics = getEnvironment().getMetricGroup()
 			.addOperator(headName.startsWith("CHAIN") ? headName.substring(6) : headName);
+		this.metrics.getIOMetricGroup().reuseInputMetricsForTask();
+		if (config.getNumberOfChainedStubs() == 0) {
+			this.metrics.getIOMetricGroup().reuseOutputMetricsForTask();
+		}
 
 		// initialize the readers.
 		// this does not yet trigger any stream consuming or processing.
@@ -649,9 +666,6 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 
 		int currentReaderOffset = 0;
 
-		AccumulatorRegistry registry = getEnvironment().getAccumulatorRegistry();
-		AccumulatorRegistry.Reporter reporter = registry.getReadWriteReporter();
-
 		for (int i = 0; i < numInputs; i++) {
 			//  ---------------- create the input readers ---------------------
 			// in case where a logical input unions multiple physical inputs, create a union reader
@@ -674,9 +688,6 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 			} else {
 				throw new Exception("Illegal input group size in task configuration: " + groupSize);
 			}
-
-			inputReaders[i].setReporter(reporter);
-			inputReaders[i].setMetricGroup(getEnvironment().getMetricGroup().getIOMetricGroup());
 
 			currentReaderOffset += groupSize;
 		}
@@ -886,6 +897,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 					// close the async barrier if there is one
 					if (this.tempBarriers[i] != null) {
 						this.tempBarriers[i].close();
+						this.tempBarriers[i] = null;
 					}
 
 					// recreate the local strategy
@@ -927,7 +939,8 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 				UnilateralSortMerger<?> sorter = new UnilateralSortMerger(getMemoryManager(), getIOManager(),
 					this.inputIterators[inputNum], this, this.inputSerializers[inputNum], getLocalStrategyComparator(inputNum),
 					this.config.getRelativeMemoryInput(inputNum), this.config.getFilehandlesInput(inputNum),
-					this.config.getSpillingThresholdInput(inputNum), this.getExecutionConfig().isObjectReuseEnabled());
+					this.config.getSpillingThresholdInput(inputNum), this.config.getUseLargeRecordHandler(),
+					this.getExecutionConfig().isObjectReuseEnabled());
 				// set the input to null such that it will be lazily fetched from the input strategy
 				this.inputs[inputNum] = null;
 				this.localStrategies[inputNum] = sorter;
@@ -963,7 +976,8 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 					(GroupCombineFunction) localStub, getMemoryManager(), getIOManager(), this.inputIterators[inputNum],
 					this, this.inputSerializers[inputNum], getLocalStrategyComparator(inputNum),
 					this.config.getRelativeMemoryInput(inputNum), this.config.getFilehandlesInput(inputNum),
-					this.config.getSpillingThresholdInput(inputNum), this.getExecutionConfig().isObjectReuseEnabled());
+					this.config.getSpillingThresholdInput(inputNum), this.getTaskConfig().getUseLargeRecordHandler(),
+					this.getExecutionConfig().isObjectReuseEnabled());
 				cSorter.setUdfConfiguration(this.config.getStubParameters());
 
 				// set the input to null such that it will be lazily fetched from the input strategy
@@ -1009,13 +1023,10 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 
 		ClassLoader userCodeClassLoader = getUserCodeClassLoader();
 
-		AccumulatorRegistry accumulatorRegistry = getEnvironment().getAccumulatorRegistry();
-		AccumulatorRegistry.Reporter reporter = accumulatorRegistry.getReadWriteReporter();
-
-		this.accumulatorMap = accumulatorRegistry.getUserMap();
+		this.accumulatorMap = getEnvironment().getAccumulatorRegistry().getUserMap();
 
 		this.output = initOutputs(this, userCodeClassLoader, this.config, this.chainedTasks, this.eventualOutputs,
-				this.getExecutionConfig(), reporter, this.accumulatorMap);
+				this.getExecutionConfig(), this.accumulatorMap);
 	}
 
 	public DistributedRuntimeUDFContext createRuntimeContext(MetricGroup metrics) {
@@ -1060,7 +1071,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	}
 
 	@Override
-	public AbstractInvokable getOwningNepheleTask() {
+	public AbstractInvokable getContainingTask() {
 		return this;
 	}
 
@@ -1070,7 +1081,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	}
 
 	@Override
-	public MetricGroup getMetricGroup() {
+	public OperatorMetricGroup getMetricGroup() {
 		return metrics;
 	}
 
@@ -1153,7 +1164,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	 *
 	 * @param message The main message for the log.
 	 * @param taskName The name of the task.
-	 * @param parent The nephele task that contains the code producing the message.
+	 * @param parent The task that contains the code producing the message.
 	 *
 	 * @return The string for logging.
 	 */
@@ -1209,7 +1220,7 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	 * @return The OutputCollector that data produced in this task is submitted to.
 	 */
 	public static <T> Collector<T> getOutputCollector(AbstractInvokable task, TaskConfig config, ClassLoader cl,
-			List<RecordWriter<?>> eventualOutputs, int outputOffset, int numOutputs, AccumulatorRegistry.Reporter reporter) throws Exception
+			List<RecordWriter<?>> eventualOutputs, int outputOffset, int numOutputs) throws Exception
 	{
 		if (numOutputs == 0) {
 			return null;
@@ -1242,8 +1253,6 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 			final RecordWriter<SerializationDelegate<T>> recordWriter =
 					new RecordWriter<SerializationDelegate<T>>(task.getEnvironment().getWriter(outputOffset + i), oe);
 
-			// setup live accumulator counters
-			recordWriter.setReporter(reporter);
 			recordWriter.setMetricGroup(task.getEnvironment().getMetricGroup().getIOMetricGroup());
 
 			writers.add(recordWriter);
@@ -1259,11 +1268,10 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 	 * The output collector applies the configured shipping strategy.
 	 */
 	@SuppressWarnings("unchecked")
-	public static <T> Collector<T> initOutputs(AbstractInvokable nepheleTask, ClassLoader cl, TaskConfig config,
+	public static <T> Collector<T> initOutputs(AbstractInvokable containingTask, ClassLoader cl, TaskConfig config,
 										List<ChainedDriver<?, ?>> chainedTasksTarget,
 										List<RecordWriter<?>> eventualOutputs,
 										ExecutionConfig executionConfig,
-										AccumulatorRegistry.Reporter reporter,
 										Map<String, Accumulator<?,?>> accumulatorMap)
 	throws Exception
 	{
@@ -1298,21 +1306,25 @@ public class BatchTask<S extends Function, OT> extends AbstractInvokable impleme
 
 				if (i == numChained - 1) {
 					// last in chain, instantiate the output collector for this task
-					previous = getOutputCollector(nepheleTask, chainedStubConf, cl, eventualOutputs, 0, chainedStubConf.getNumOutputs(), reporter);
+					previous = getOutputCollector(containingTask, chainedStubConf, cl, eventualOutputs, 0, chainedStubConf.getNumOutputs());
 				}
 
-				ct.setup(chainedStubConf, taskName, previous, nepheleTask, cl, executionConfig, accumulatorMap);
+				ct.setup(chainedStubConf, taskName, previous, containingTask, cl, executionConfig, accumulatorMap);
 				chainedTasksTarget.add(0, ct);
+
+				if (i == numChained - 1) {
+					ct.getIOMetrics().reuseOutputMetricsForTask();
+				}
 
 				previous = ct;
 			}
-			// the collector of the first in the chain is the collector for the nephele task
+			// the collector of the first in the chain is the collector for the task
 			return (Collector<T>) previous;
 		}
 		// else
 
 		// instantiate the output collector the default way from this configuration
-		return getOutputCollector(nepheleTask , config, cl, eventualOutputs, 0, numOutputs, reporter);
+		return getOutputCollector(containingTask , config, cl, eventualOutputs, 0, numOutputs);
 	}
 	
 	// --------------------------------------------------------------------------------------------
